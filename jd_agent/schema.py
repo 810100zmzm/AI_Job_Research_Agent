@@ -159,7 +159,7 @@ class ProjectFact:
     def ref(self) -> str:
         if self.line_no > 0:
             return f"{self.source_file}::L{self.line_no}"
-        return f"{self.source_file}::补充说明"
+        return self.source_file
 
     @property
     def level_label(self) -> str:
