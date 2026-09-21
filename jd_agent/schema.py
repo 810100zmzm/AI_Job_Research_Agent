@@ -41,6 +41,26 @@ DECISION_ASK = "Ask"
 DECISION_STOP = "Stop"
 DECISIONS = (DECISION_CONTINUE, DECISION_ADJUST, DECISION_ASK, DECISION_STOP)
 
+# ---- 来源标记：规则算出来的 vs 大模型生成的 ---------------------------------
+# 报告里每一段都要能回答「这段话是谁写的」，因此每条内容都带一个 source。
+SOURCE_RULE = "rule"
+SOURCE_LLM_SUGGEST = "llm-suggest"       # 建议写法草稿生成
+SOURCE_LLM_INTERVIEW = "llm-interview"   # 面试追问预演
+SOURCE_LLM_POLISH = "llm-polish"         # 报告自然语言润色
+SOURCE_LLM = (SOURCE_LLM_SUGGEST, SOURCE_LLM_INTERVIEW, SOURCE_LLM_POLISH)
+SOURCES = (SOURCE_RULE,) + SOURCE_LLM
+SOURCE_LABEL = {SOURCE_RULE: "[规则]"}
+SOURCE_LABEL.update({source: "[LLM]" for source in SOURCE_LLM})
+
+# 一块 LLM 内容的状态（红线 3：调用失败必须看得见，主报告照跑）
+STATUS_OFF = "未启用"
+STATUS_OK = "正常"
+STATUS_FAILED = "调用失败"
+STATUS_EMPTY = "未返回可用内容"
+STATUS_DISCARDED = "已丢弃"
+STATUS_IDLE = "已闲置"          # 按用户要求暂时停用的块（例如待改版的面试追问预演）
+STATUS_SKIPPED = "已达调用上限"   # 还有活没干，但本次运行的调用预算用完了
+
 # ---- 最终判断 ---------------------------------------------------------------
 VERDICT_YES = "值得写"
 VERDICT_EDIT = "值得写，但必须先改写"
@@ -170,6 +190,29 @@ class ProjectFact:
         return _short(self.text)
 
 
+@dataclass(frozen=True)
+class ImageRef:
+    """项目描述里引用到的一张本地图片（可选视觉层的输入）。"""
+
+    raw: str          # 原文里怎么写的就是什么，例如 "assets/chart.png"
+    path: str         # 解析后的本地路径（已确认文件存在）
+    ref: str          # 报告里的出处写法：「图片:<相对路径>」
+    line_no: int = 0  # 引用出现在第几行；--image 显式传入时为 0
+
+
+@dataclass
+class VisionReport:
+    """视觉层（可选）的执行结果：只记录看到了什么、做了什么，不参与判定。"""
+
+    enabled: bool = False
+    model: str = ""
+    images: List[ImageRef] = field(default_factory=list)
+    parsed: int = 0            # 真正解析出事实的图片数
+    facts_added: int = 0
+    error: str = ""
+    notes: List[str] = field(default_factory=list)
+
+
 @dataclass
 class Project:
     """一份项目描述（解析结果）。"""
@@ -280,8 +323,104 @@ class Risk:
 
 
 @dataclass
+class LlmBlock:
+    """报告生成之后，由大模型追加的一块内容（三类任务各一块）。
+
+    硬边界：只挂在 Verdict.llm_report 上，绝不替换规则写出的结论、理由、风险与建议写法；
+    每块都带 source（llm-suggest / llm-interview / llm-polish），报告里一律标 [LLM]。
+    """
+
+    source: str
+    title: str
+    model: str = ""
+    enabled: bool = True          # 是否真的发出了调用
+    calls: int = 0                # 这一块用掉的调用次数（含重试）
+    text: str = ""                # 草稿 / 润色这类整段文本
+    items: List[Dict[str, str]] = field(default_factory=list)   # 追问预演这类条目
+    error: str = ""
+    failed: bool = False          # 调用本身失败（网络 / 额度 / 超时 / 超上限）
+    discarded: bool = False       # 触碰「LLM 不做结论」红线，内容已丢弃
+    idle: bool = False            # 按用户要求闲置（待改版），本次不调用模型
+    skipped: bool = False         # 预算用完，没轮到它
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return SOURCE_LABEL.get(self.source, "[LLM]")
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.text or self.items)
+
+    @property
+    def status(self) -> str:
+        """报告里显示的状态：未启用 / 调用失败 / 正常 ……"""
+        if not self.enabled:
+            return STATUS_OFF
+        if self.idle:
+            return STATUS_IDLE
+        if self.discarded:
+            return STATUS_DISCARDED
+        if self.skipped:
+            return STATUS_SKIPPED
+        if self.failed:
+            return STATUS_FAILED
+        if self.is_empty:
+            return STATUS_EMPTY
+        return STATUS_OK
+
+    @property
+    def ok(self) -> bool:
+        return not (self.failed or self.discarded or self.skipped or self.idle) and not self.is_empty
+
+    def summary(self) -> str:
+        if self.items:
+            return f"{len(self.items)} 条"
+        if self.text:
+            return f"{len(self.text)} 字"
+        return "无内容"
+
+
+@dataclass
+class LlmReport:
+    """一次运行里 LLM 装饰层的整体情况：三块内容 + 调用账本（可限额、可降级）。"""
+
+    enabled: bool = False
+    model: str = ""
+    calls: int = 0                # 本次运行实际发出的调用数（含重试）
+    call_limit: int = 10          # 调用上限，默认 10
+    timeout: float = 30.0         # 单次调用超时（秒）
+    retries: int = 1              # 失败重试次数
+    blocks: List[LlmBlock] = field(default_factory=list)
+    note: str = ""                # 整体说明，例如「未配置 DEEPSEEK_API_KEY」
+
+    def block(self, source: str) -> Optional[LlmBlock]:
+        for item in self.blocks:
+            if item.source == source:
+                return item
+        return None
+
+    @property
+    def sources(self) -> List[str]:
+        return [item.source for item in self.blocks]
+
+    @property
+    def ok_count(self) -> int:
+        return len([item for item in self.blocks if item.ok])
+
+    @property
+    def degraded(self) -> List[LlmBlock]:
+        """没能正常产出内容的块（未启用 / 调用失败 / 已丢弃 / 空内容）。"""
+        return [item for item in self.blocks if not item.ok]
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.blocks and not self.note
+
+
+@dataclass
 class Verdict:
-    """最终判断。"""
+    """最终判断（全部由规则产生）。"""
 
     call: str
     headline: str
@@ -289,6 +428,7 @@ class Verdict:
     risks: List[Risk] = field(default_factory=list)
     rewrite: str = ""
     stop_reason: str = ""
+    llm_report: Optional[LlmReport] = None
 
 
 @dataclass
@@ -307,10 +447,16 @@ class AgentState:
     answer: str = ""
     sufficiency: str = ""
     verdict: Optional[Verdict] = None
+    vision: VisionReport = field(default_factory=VisionReport)
 
     @property
     def decision(self) -> str:
         return self.trace[-1].decision if self.trace else ""
+
+    @property
+    def llm_report(self) -> Optional[LlmReport]:
+        """报告生成后追加的 LLM 内容（可选）：三块生成结果，不参与判定。"""
+        return self.verdict.llm_report if self.verdict else None
 
     @property
     def finished(self) -> bool:

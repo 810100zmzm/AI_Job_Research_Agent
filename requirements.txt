@@ -1,2 +1,9 @@
-# 本版本零依赖：只靠 Python 标准库就能跑完整流程（需要 Python 3.9+）。
-# 没有可选依赖，也不联网。
+# 唯一的依赖：python-dotenv，用来读项目根目录的 .env（需要 Python 3.9+）。
+python-dotenv>=1.0
+
+# 可选依赖：网页版前端（python -m streamlit run streamlit_app.py）。
+# 只用命令行的话不必装；要装就执行：pip install "streamlit>=1.49"
+# streamlit>=1.49
+
+# 两路 HTTPS 调用仍然走标准库 urllib，不需要 openai / requests 这类 SDK。
+# 不加 --llm / --vision / --check-llm 时不会加载 .env，也不会发任何网络请求。

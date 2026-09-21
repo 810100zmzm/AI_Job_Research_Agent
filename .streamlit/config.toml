@@ -1,0 +1,35 @@
+# Streamlit 主题：浅色、克制，让报告本身当主角。不引入外部字体，离线也能用。
+[theme]
+base = "light"
+primaryColor = "#2b6cb0"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f6f8fa"
+textColor = "#1f2328"
+linkColor = "#2b6cb0"
+codeTextColor = "#1f2328"
+codeBackgroundColor = "#f0f2f5"
+borderColor = "#d8dee4"
+showWidgetBorder = true
+showSidebarBorder = false
+baseRadius = "8px"
+buttonRadius = "8px"
+baseFontSize = 15
+baseFontWeight = 400
+headingFontSizes = ["30px", "23px", "19px", "16px", "14px", "12px"]
+headingFontWeights = [600, 600, 600, 500, 500, 500]
+linkUnderline = false
+dataframeBorderColor = "#d8dee4"
+dataframeHeaderBackgroundColor = "#f6f8fa"
+chartCategoricalColors = ["#2b6cb0", "#14892c", "#b78103", "#6b46c1", "#c0392b", "#0f766e", "#57606a"]
+
+greenColor = "#14892c"
+orangeColor = "#b78103"
+redColor = "#c0392b"
+blueColor = "#2b6cb0"
+violetColor = "#6b46c1"
+grayColor = "#57606a"
+
+[theme.sidebar]
+backgroundColor = "#f6f8fa"
+secondaryBackgroundColor = "#ffffff"
+borderColor = "#d8dee4"

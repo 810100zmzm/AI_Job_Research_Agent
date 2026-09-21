@@ -9,15 +9,38 @@
 两条纪律：
   * 资料不足时不许猜 —— Decision=Ask，只问一个最有价值的问题，把判断交回给用户；
   * 证据够了就停 —— Decision=Stop，并写明 StopReason。
+
+v1.1 的 LLM 装饰层（--llm，可选）：只在「规则报告已生成」之后介入，追加三块规则做不到的内容
+（llm-suggest 建议写法草稿 / llm-interview 面试追问预演 / llm-polish 报告润色），每块都带 source。
+LLM 不改结论、不改 Decision、不改词典；失败只降级成一块「调用失败」的文字。
+不带 --llm 时这条链路一步都不走，Trace 与输出与 v1.0 完全一致。
 """
 from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
+from .settings import LLMSettings
 from .evidence import match_requirements
+from .generate import (
+    CallBudget,
+    IDLE_REASON,
+    TASK_ACTION,
+    TASK_DUTY,
+    failed_llm_report,
+    generate_llm_report,
+    unavailable_llm_report,
+)
 from .jd import load_jd
+from .llm import (
+    DEFAULT_CALL_LIMIT,
+    DEFAULT_CALL_TIMEOUT,
+    DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_QWEN_VL_MODEL,
+    DEFAULT_RETRIES,
+    OpenAICompatClient,
+)
 from .project import apply_answer, load_project
 from .schema import (
     DECISION_ADJUST,
@@ -39,12 +62,17 @@ from .schema import (
     VERDICT_YES,
     AgentState,
     EvidenceMatch,
+    JobPosting,
+    LlmBlock,
+    LlmReport,
     Project,
     Reason,
     Risk,
     TraceStep,
     Verdict,
+    VisionReport,
 )
+from .vision import collect_images, enrich_project
 
 # 判定口径（全部写死在这里，方便直接检查，也方便日后调）
 MAX_ROUNDS = 2          # 最多 Ask 一轮，问完还不足就给保守结论，不无限追问
@@ -59,8 +87,24 @@ def run_agent(
     answer: str = "",
     select_title: str = "",
     max_rounds: int = MAX_ROUNDS,
+    llm: bool = False,
+    vision: bool = False,
+    llm_max_calls: int = DEFAULT_CALL_LIMIT,
+    settings: Optional[LLMSettings] = None,
+    text_client: Optional[OpenAICompatClient] = None,
+    vision_client: Optional[OpenAICompatClient] = None,
+    images: Sequence[str] = (),
+    posting: Optional[JobPosting] = None,
+    llm_budget: Optional[CallBudget] = None,
 ) -> AgentState:
-    """跑完一次完整的 Agent Loop，返回带着 Trace 的状态。"""
+    """跑完一次完整的 Agent Loop，返回带着 Trace 的状态。
+
+    llm / vision 默认关闭：不传这两个开关时完全不联网，行为与纯规则版本一致。
+    llm_max_calls 是 LLM 装饰层的调用上限（默认 10 次，含重试）。
+    posting 用于批量模式：直接喂已解析好的岗位，跳过 load_jd；
+    llm_budget 让多个岗位共用一份调用账本（一次运行的总调用数仍 ≤ llm_max_calls）。
+    text_client / vision_client 用于注入替身（测试或二次开发），优先级高于 settings。
+    """
     if max_rounds < 1:
         raise ValueError("max_rounds 至少为 1")
 
@@ -81,7 +125,7 @@ def run_agent(
         )
 
     # ---- 1. 读 JD ---------------------------------------------------------
-    posting = load_jd(jd_path, select_title)
+    posting = posting if posting is not None else load_jd(jd_path, select_title)
     record(
         "ReadJD",
         f"读取 {Path(str(jd_path)).name}（{posting.line_count} 行），识别到 {posting.position_count} 个岗位，"
@@ -94,15 +138,69 @@ def run_agent(
     # ---- 2. 读项目描述 ----------------------------------------------------
     project = load_project(project_path)
     counts = _level_counts(project)
+    image_refs, _ = collect_images(project.text, project_path)
+    picture_hint = (
+        f"；另外引用了 {len(image_refs)} 张本地图片（本次未解析：加 --vision 可读成文字事实）"
+        if image_refs and not vision
+        else ""
+    )
     record(
         "ReadProject",
         f"读取 {Path(str(project_path)).name}（{project.line_count} 行），解析出 {len(project.facts)} 条事实："
         f"有结果 {counts[EVIDENCE_RESULT]} / 有动作 {counts[EVIDENCE_ACTION]} / 仅提及 {counts[EVIDENCE_MENTION]}；"
-        f"能看出「这是我做的」{len(project.ownership_facts)} 条",
+        f"能看出「这是我做的」{len(project.ownership_facts)} 条{picture_hint}",
         f"state.project = {len(project.facts)} 条事实",
         DECISION_CONTINUE,
         "项目描述已拆成可核验的事实条目",
     )
+
+    # ---- 3. 图片取证（可选；只有 --vision 才联网）-------------------------
+    vision_refs, vision_notes = collect_images(project.text, project_path, tuple(images) if vision else ())
+    vision_report = VisionReport(enabled=False, images=vision_refs, notes=list(vision_notes))
+
+    if vision:
+        vision_model = settings.vision_model if settings else DEFAULT_QWEN_VL_MODEL
+        client = vision_client or _build_client(settings, "vision")
+        before = len(project.facts)
+        listed = "、".join(item.ref for item in vision_refs) or "无"
+
+        if client is None:
+            vision_report.error = "未配置 DASHSCOPE_API_KEY / QWEN_API_KEY"
+            record(
+                "EnrichWithVision",
+                f"已开启 --vision，但没有可用的 Key（DASHSCOPE_API_KEY / QWEN_API_KEY）：本次不联网；"
+                f"描述里发现 {len(vision_refs)} 张本地图片（{listed}）",
+                "state.vision = 缺 Key，没有发出任何请求，证据池未变化",
+                DECISION_CONTINUE,
+                "没有 Key 就保持离线，规则链路与结论完全不受影响",
+            )
+        elif not vision_refs:
+            record(
+                "EnrichWithVision",
+                "已开启 --vision，但项目描述里没有本地图片引用，也没有 --image 传入：没有可解析的内容",
+                "state.vision = 0 张图片",
+                DECISION_CONTINUE,
+                "没有图片可读，直接进入能力抽取",
+            )
+        else:
+            report = enrich_project(project, vision_refs, client, vision_model)
+            report.notes = list(vision_notes) + list(report.notes)
+            vision_report = report
+            added_counts = Counter(fact.level for fact in project.facts[before:])
+            note_tail = f"；{report.notes[0]}" if report.notes else ""
+            record(
+                "EnrichWithVision",
+                f"用 {vision_model} 解析 {report.parsed}/{len(vision_refs)} 张本地图片，新增 {report.facts_added} 条文字事实"
+                f"（有结果 {added_counts.get(EVIDENCE_RESULT, 0)} / 有动作 {added_counts.get(EVIDENCE_ACTION, 0)} / "
+                f"仅提及 {added_counts.get(EVIDENCE_MENTION, 0)}）—— 等级一律由 classify() 判定，不采信模型自述"
+                + (f"；{report.error}" if report.error else "")
+                + note_tail,
+                f"state.project.facts {before} -> {len(project.facts)}（新增事实的 source_file 形如「图片:相对路径」）",
+                DECISION_CONTINUE,
+                "图片事实已并入同一证据池，继续用规则检索"
+                if report.facts_added
+                else "图片没有提供可用事实，按原证据继续检索",
+            )
 
     rounds = 1
 
@@ -144,6 +242,7 @@ def run_agent(
         matches=[],
         trace=trace,
         rounds=rounds,
+        vision=vision_report,
     )
 
     if not core:
@@ -216,29 +315,155 @@ def run_agent(
 
     state.sufficiency = "insufficient_after_ask" if insufficient else "enough"
 
-    # ---- 7. 给判断并停止 --------------------------------------------------
+    # ---- 7. 规则下结论：报告内容定稿（结论 / 理由 / 风险 / 建议写法 / StopReason）----
     verdict = build_verdict(state, insufficient=insufficient)
     state.verdict = verdict
     if insufficient:
-        record(
-            "Judge",
+        observation = (
             f"已问过一轮仍缺关键信息（{diagnosis}）；现有证据：核心覆盖 {len(state.solid)}/{len(core)}，"
-            f"结果级证据 {state.result_match_count} 条",
-            f"state.verdict = 「{verdict.call}」",
-            DECISION_STOP,
-            verdict.stop_reason,
+            f"结果级证据 {state.result_match_count} 条"
         )
     else:
-        record(
-            "Judge",
+        observation = (
             f"核心覆盖 {len(state.solid)}/{len(core)}（{state.coverage:.0%}），"
             f"结果级证据 {state.result_match_count} 条，仍缺 {len(state.missing)} 项："
-            f"{'、'.join(item.requirement_name for item in state.missing) or '无'}",
-            f"state.verdict = 「{verdict.call}」；理由 {len(verdict.reasons)} 条、风险 {len(verdict.risks)} 条",
-            DECISION_STOP,
-            verdict.stop_reason,
+            f"{'、'.join(item.requirement_name for item in state.missing) or '无'}"
         )
+    state_update = (
+        f"state.verdict = 「{verdict.call}」；理由 {len(verdict.reasons)} 条、风险 {len(verdict.risks)} 条"
+    )
+
+    if not llm:
+        # 不带 --llm：Judge 就是最后一步，与 v1.0 一字不差（完全不联网）
+        record("Judge", observation, state_update, DECISION_STOP, verdict.stop_reason)
+        return state
+
+    record(
+        "Judge",
+        observation + "；以上由规则产出、已经定稿，LLM 不会改动它",
+        state_update,
+        DECISION_CONTINUE,
+        "证据够了、结论已定；下一步只让 LLM 在这个已生成的报告上补三块规则做不到的内容",
+    )
+
+    # ---- 8~10. LLM 装饰层：报告已生成之后才介入，不改结论、不改 Decision ----
+    report = _decorate_with_llm(state, text_client, settings, llm_max_calls, llm_budget)
+    verdict.llm_report = report
+    for block in report.blocks:
+        record(
+            TASK_ACTION.get(block.source, block.source),
+            _llm_observation(report, block),
+            _llm_state_update(report, block),
+            DECISION_CONTINUE,
+            "LLM 只往报告里追加带 source 的内容，不参与判定",
+        )
+
+    # ---- 11. 收尾：Stop 并写明 StopReason ---------------------------------
+    record(
+        "Finish",
+        f"报告定稿：规则 {len(verdict.reasons)} 条理由 / {len(verdict.risks)} 条风险 + "
+        f"LLM {report.ok_count}/{len(report.blocks)} 块（调用 {report.calls}/{report.call_limit} 次，"
+        f"单次超时 {report.timeout:g}s，重试 {report.retries} 次）；"
+        f"降级明细：{'、'.join(f'{item.source}={item.status}' for item in report.degraded) or '无'}",
+        "state.final = 报告（规则段 + LLM 段，逐段带 [规则] / [LLM] 标记）",
+        DECISION_STOP,
+        verdict.stop_reason,
+    )
     return state
+
+
+def _build_client(
+    settings: Optional[LLMSettings], layer: str, timeout: Optional[float] = None
+) -> Optional[OpenAICompatClient]:
+    """按配置建客户端；没配 key 就返回 None（缺 key 绝不发请求）。"""
+    if settings is None:
+        return None
+    seconds = settings.timeout if timeout is None else timeout
+    if layer == "text":
+        if not settings.text_ready:
+            return None
+        return OpenAICompatClient(
+            settings.text_base_url, settings.text_api_key, settings.text_model, seconds
+        )
+    if not settings.vision_ready:
+        return None
+    return OpenAICompatClient(
+        settings.vision_base_url, settings.vision_api_key, settings.vision_model, seconds
+    )
+
+
+def _decorate_with_llm(
+    state: AgentState,
+    client: Optional[OpenAICompatClient],
+    settings: Optional[LLMSettings],
+    max_calls: int,
+    budget: Optional[CallBudget] = None,
+) -> LlmReport:
+    """报告已生成之后调 DeepSeek，产出三块内容（草稿 / 追问预演 / 润色）。
+
+    任何失败都只降级成块级文字：没有 Key → 三块「未启用」；调用失败 → 该块「调用失败」。
+    budget 由调用方传进来时（批量跑多个岗位）多份报告共用同一份调用账本，总调用数不变。
+    """
+    model = settings.text_model if settings else DEFAULT_DEEPSEEK_MODEL
+    limit = max(1, int(max_calls or DEFAULT_CALL_LIMIT))
+    ledger = budget if budget is not None else build_text_budget(settings, client, limit=limit)
+    if ledger is None:
+        return unavailable_llm_report(model, "未配置 DEEPSEEK_API_KEY（没有联网）")
+    try:
+        return generate_llm_report(state, ledger)
+    except Exception as exc:  # 兜底：装饰层不许打断主流程
+        return failed_llm_report(ledger.model, f"生成层异常：{exc.__class__.__name__}: {exc}")
+
+
+def build_text_budget(
+    settings: Optional[LLMSettings],
+    text_client: Optional[OpenAICompatClient] = None,
+    limit: int = DEFAULT_CALL_LIMIT,
+) -> Optional[CallBudget]:
+    """建一份可复用的调用账本（批量跑多个岗位时共用同一份预算）。
+
+    没有可用客户端（缺 Key）时返回 None，调用方按「未启用」处理，一次请求都不发。
+    """
+    model = settings.text_model if settings else DEFAULT_DEEPSEEK_MODEL
+    target = text_client or _build_client(settings, "text", timeout=DEFAULT_CALL_TIMEOUT)
+    if target is None:
+        return None
+    return CallBudget(
+        target,
+        model,
+        limit=max(1, int(limit or DEFAULT_CALL_LIMIT)),
+        timeout=DEFAULT_CALL_TIMEOUT,
+        retries=DEFAULT_RETRIES,
+    )
+
+
+def _llm_observation(report: LlmReport, block: LlmBlock) -> str:
+    duty = TASK_DUTY.get(block.source, "")
+    if block.idle:
+        return (
+            f"{duty}：已闲置（{IDLE_REASON}），本次没有发出调用；"
+            "报告里仍保留这一块，并标注「已闲置」"
+        )
+    if block.skipped:
+        return f"{duty}：没有调用（{block.error}），该块标「已达调用上限」"
+    if block.error and not block.calls:
+        return f"{duty}：没有发出调用（{block.error}）"
+    if block.error:
+        return (
+            f"{duty}：调用 {block.calls} 次后失败（{block.error}）；"
+            f"该块显示「{block.status}」，上面的规则报告不受影响"
+        )
+    return (
+        f"{duty}：产出 {block.summary()}（source={block.source}，模型 {block.model}）；"
+        "内容与规则段落分开标注，规则结论未被替换"
+    )
+
+
+def _llm_state_update(report: LlmReport, block: LlmBlock) -> str:
+    return (
+        f"state.llm_report.blocks[{block.source}] = {block.status}"
+        f"（本次累计调用 {report.calls}/{report.call_limit}）"
+    )
 
 
 def assess_sufficiency(state: AgentState) -> Tuple[bool, str, str, str]:

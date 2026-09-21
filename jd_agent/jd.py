@@ -2,7 +2,8 @@
 
 格式上尽量宽容：
   * `## 任职要求` / `**任职要求**` / `任职要求：` 都能认出章节
-  * 一个文件里放了多个岗位时，默认只分析第一个，也可以用 --jd-title 指定
+  * 一个文件里放了多个岗位时：load_jd 默认只取第一个（可用 --jd-title 指定），
+    load_jd_positions 一次返回全部岗位（不指定 --jd 的批量模式走这条）
   * 同一项能力被多行提到时，只保留层级最高（必备 > 职责 > 加分）的那一条
 """
 from __future__ import annotations
@@ -156,6 +157,32 @@ def parse_jd_text(text: str, source_file: str, jd_id: str = "JD01", select: str 
     else:
         chosen = blocks[0]
 
+    return _build_posting(chosen, lines, source_file, jd_id, len(blocks), titles)
+
+
+def parse_jd_positions(text: str, source_file: str) -> List[JobPosting]:
+    """把一个文件里的**所有**岗位都解析出来（顺序与文件一致）。
+
+    没有指定 --jd 时走这条路径：input/jd 下每个文件、每个岗位各出一份报告。
+    """
+    lines = text.splitlines()
+    blocks = _split_positions(lines)
+    titles = [title for title, _ in blocks]
+    stem = Path(source_file).stem
+    return [
+        _build_posting(block, lines, source_file, f"{stem}#{index}", len(blocks), titles)
+        for index, block in enumerate(blocks, start=1)
+    ]
+
+
+def _build_posting(
+    chosen: Tuple[str, List[Tuple[int, str]]],
+    lines: Sequence[str],
+    source_file: str,
+    jd_id: str,
+    position_count: int,
+    titles: Sequence[str],
+) -> JobPosting:
     title, body = chosen
     requirements: List[Requirement] = []
     company = ""
@@ -227,7 +254,7 @@ def parse_jd_text(text: str, source_file: str, jd_id: str = "JD01", select: str 
         job_type=job_type,
         line_count=len(lines),
         bullet_count=matched_lines,
-        position_count=len(blocks),
+        position_count=position_count,
         position_titles=[t for t in titles if t],
         requirements=_dedupe(requirements),
     )
@@ -236,3 +263,9 @@ def parse_jd_text(text: str, source_file: str, jd_id: str = "JD01", select: str 
 def load_jd(path, select: str = "") -> JobPosting:
     path = Path(path)
     return parse_jd_text(read_text(path), source_file=display_path(path), select=select)
+
+
+def load_jd_positions(path) -> List[JobPosting]:
+    """读一个 JD 文件，返回里面所有岗位。"""
+    path = Path(path)
+    return parse_jd_positions(read_text(path), source_file=display_path(path))

@@ -1,14 +1,17 @@
 """渲染：把一次 Agent 运行的结果输出成 Markdown / JSON / HTML / 终端文本。
 
-四种输出说同一件事：结论 -> 理由 / 风险 -> 岗位要求对照表 -> 完整 Trace。
+四种输出说同一件事：结论 -> 理由 / 风险 ->（可选）LLM 生成内容 -> 岗位要求对照表 -> 完整 Trace。
 Trace 是这份产物里最该被检查的部分：每一步都能看到「看到了什么、状态怎么变、下一步为什么这么走」。
+
+来源标记：规则算出来的段落一律标 [规则]，大模型生成的一律标 [LLM] 并带上 source
+（llm-suggest / llm-interview / llm-polish）；不带 --llm 时 LLM 那一节整体不出现。
 """
 from __future__ import annotations
 
 import html as html_lib
 import json
 from datetime import datetime
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 from .agent import COVERAGE_MIN, COVERAGE_OK, MAX_ROUNDS, MIN_FACTS
 from .schema import (
@@ -16,10 +19,13 @@ from .schema import (
     EVIDENCE_MENTION,
     EVIDENCE_NONE,
     EVIDENCE_RESULT,
+    SOURCE_LABEL,
+    SOURCE_RULE,
     VERDICT_EDIT,
     VERDICT_NO,
     VERDICT_YES,
     AgentState,
+    LlmBlock,
 )
 
 LEVEL_ICON = {
@@ -30,6 +36,23 @@ LEVEL_ICON = {
 }
 VERDICT_ICON = {VERDICT_YES: "✅", VERDICT_EDIT: "🟠", VERDICT_NO: "❌"}
 CELL_LIMIT = 78
+CN_NUM = ("一", "二", "三", "四", "五", "六")
+
+
+def _has_llm(state: AgentState) -> bool:
+    """这份报告里有没有 LLM 生成内容（不带 --llm 时整节都不出现）。"""
+    report = state.llm_report
+    return bool(report is not None and not report.is_empty)
+
+
+def _sections(state: AgentState) -> Dict[str, str]:
+    """章节编号：有 LLM 段时多一节，后面的编号自动顺延。"""
+    keys = ["verdict"] + (["llm"] if _has_llm(state) else []) + ["evidence", "trace", "params"]
+    return {key: CN_NUM[index] for index, key in enumerate(keys)}
+
+
+def _source_label(source: str) -> str:
+    return SOURCE_LABEL.get(source, "[LLM]")
 
 
 def _stamp(generated_at: str) -> str:
@@ -59,9 +82,10 @@ def render_markdown(state: AgentState, generated_at: str = "") -> str:
         lines += _md_question(state)
     else:
         lines += _md_verdict(state)
+        lines += _md_llm(state)
     lines += _md_evidence(state)
     lines += _md_trace(state)
-    lines += _md_params()
+    lines += _md_params(state)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -69,27 +93,78 @@ def _md_verdict(state: AgentState) -> List[str]:
     verdict = state.verdict
     if verdict is None:
         return []
+    sec = _sections(state)
     lines = [
         "",
-        "## 一、结论",
+        f"## {sec['verdict']}、结论 {_source_label(SOURCE_RULE)}",
         "",
-        f"### {VERDICT_ICON.get(verdict.call, '')} {verdict.call}",
+        f"### {VERDICT_ICON.get(verdict.call, '')} {verdict.call} {_source_label(SOURCE_RULE)}",
         "",
         verdict.headline,
         "",
         f"**StopReason**：{verdict.stop_reason}",
         "",
-        f"### 为什么（{len(verdict.reasons)} 条）",
+        f"### 为什么（{len(verdict.reasons)} 条） {_source_label(SOURCE_RULE)}",
         "",
     ]
     for index, reason in enumerate(verdict.reasons, start=1):
         lines.append(f"{index}. {reason.text}")
         lines.append(f"    - JD 出处：`{reason.jd_ref}`　项目出处：{_refs(reason.project_refs)}")
-    lines += ["", f"### 风险（{len(verdict.risks)} 条）", ""]
+    lines += ["", f"### 风险（{len(verdict.risks)} 条） {_source_label(SOURCE_RULE)}", ""]
     for risk in verdict.risks:
         lines.append(f"- **[{risk.kind}]** {risk.text}")
     if verdict.rewrite:
-        lines += ["", "### 建议写法", "", f"`{verdict.rewrite}`"]
+        lines += ["", f"### 建议写法 {_source_label(SOURCE_RULE)}", "", f"`{verdict.rewrite}`"]
+    return lines
+
+
+def _md_llm(state: AgentState) -> List[str]:
+    """LLM 装饰层：报告已生成之后追加的三块内容，逐块标 [LLM] 与 source。"""
+    report = state.llm_report
+    if report is None or report.is_empty:
+        return []
+    sec = _sections(state)
+    lines = [
+        "",
+        f"## {sec['llm']}、LLM 生成内容（报告已生成之后追加，不是判定依据）",
+        "",
+        "> 每块都带 `source` 标记，与上面的 [规则] 段落严格分开；"
+        "「值不值得写」这个结论、以及 StopReason，始终只由规则给出。",
+        "",
+        f"- 模型：`{report.model or '未指定'}`　|　调用：{report.calls}/{report.call_limit} 次　|　"
+        f"单次超时：{report.timeout:g}s　|　失败重试：{report.retries} 次",
+    ]
+    if report.note:
+        lines.append(f"- 说明：{report.note}")
+    for block in report.blocks:
+        lines += _md_llm_block(block)
+    return lines
+
+
+def _md_llm_block(block: LlmBlock) -> List[str]:
+    lines = [
+        "",
+        f"### {block.label} {block.title}　`source: {block.source}`",
+        "",
+        f"- 状态：**{block.status}**（本块调用 {block.calls} 次，模型 `{block.model or '—'}`）",
+    ]
+    if block.items:
+        lines.append("")
+        for index, item in enumerate(block.items, start=1):
+            lines.append(f"{index}. {item.get('question', '')}")
+            extra: List[str] = []
+            if item.get("target"):
+                extra.append(f"追问点：{item['target']}")
+            if item.get("prepare"):
+                extra.append(f"怎么准备：{item['prepare']}")
+            if extra:
+                lines.append(f"    - {'　|　'.join(extra)}")
+    if block.text:
+        lines += ["", block.text]
+    if block.error:
+        lines += ["", f"> {block.error}"]
+    for note in block.notes:
+        lines.append(f"- {note}")
     return lines
 
 
@@ -111,6 +186,7 @@ code { background: #8882; padding: 1px 5px; border-radius: 4px; font-size: 12.5p
         padding: 14px 18px; margin: 14px 0; }
 .card.no { border-left-color: #c0392b; } .card.edit { border-left-color: #b78103; }
 .card.yes { border-left-color: #14892c; } .card.ask { border-left-color: #2b6cb0; }
+.card.ai { border-left-color: #6b46c1; }
 .card h3 { margin: 0 0 6px; }
 ol, ul { padding-left: 22px; }
 .step { border: 1px solid #8883; border-radius: 6px; margin: 10px 0; overflow: hidden; }
@@ -156,14 +232,15 @@ def _html_verdict(state: AgentState) -> List[str]:
     if verdict is None:
         return []
     css = {VERDICT_YES: "yes", VERDICT_EDIT: "edit"}.get(verdict.call, "no")
+    sec = _sections(state)
     parts = [
-        "<h2>一、结论</h2>",
+        f"<h2>{sec['verdict']}、结论 {_source_label(SOURCE_RULE)}</h2>",
         f'<div class="card {css}">',
-        f"<h3>{VERDICT_ICON.get(verdict.call, '')} {_e(verdict.call)}</h3>",
+        f"<h3>{VERDICT_ICON.get(verdict.call, '')} {_e(verdict.call)} {_source_label(SOURCE_RULE)}</h3>",
         f"<p>{_e(verdict.headline)}</p>",
         f'<p class="ref">StopReason：{_e(verdict.stop_reason)}</p>',
         "</div>",
-        f"<h3>为什么（{len(verdict.reasons)} 条）</h3>",
+        f"<h3>为什么（{len(verdict.reasons)} 条） {_source_label(SOURCE_RULE)}</h3>",
         "<ol>",
     ]
     for reason in verdict.reasons:
@@ -172,19 +249,74 @@ def _html_verdict(state: AgentState) -> List[str]:
             f'<span class="ref">JD 出处：<code>{_e(reason.jd_ref)}</code>　'
             f"项目出处：{_ref_html(reason.project_refs)}</span></li>"
         )
-    parts += ["</ol>", f"<h3>风险（{len(verdict.risks)} 条）</h3>", "<ul>"]
+    parts += ["</ol>", f"<h3>风险（{len(verdict.risks)} 条） {_source_label(SOURCE_RULE)}</h3>", "<ul>"]
     for risk in verdict.risks:
         parts.append(f"<li><strong>[{_e(risk.kind)}]</strong> {_e(risk.text)}</li>")
     parts.append("</ul>")
     if verdict.rewrite:
-        parts += ["<h3>建议写法</h3>", f"<p><code>{_e(verdict.rewrite)}</code></p>"]
+        parts += [
+            f"<h3>建议写法 {_source_label(SOURCE_RULE)}</h3>",
+            f"<p><code>{_e(verdict.rewrite)}</code></p>",
+        ]
+    return parts
+
+
+def _html_llm(state: AgentState) -> List[str]:
+    """LLM 装饰层：三块内容各一张卡片，逐块标 [LLM] 与 source。"""
+    report = state.llm_report
+    if report is None or report.is_empty:
+        return []
+    sec = _sections(state)
+    parts = [
+        f"<h2>{sec['llm']}、LLM 生成内容（报告已生成之后追加，不是判定依据）</h2>",
+        '<p class="ref">每块都带 <code>source</code> 标记，与上面的 [规则] 段落严格分开；'
+        "「值不值得写」这个结论、以及 StopReason，始终只由规则给出。</p>",
+        f'<p class="ref">模型：<code>{_e(report.model or "未指定")}</code>　|　'
+        f"调用：{report.calls}/{report.call_limit} 次　|　单次超时：{report.timeout:g}s　|　"
+        f"失败重试：{report.retries} 次</p>",
+    ]
+    if report.note:
+        parts.append(f'<p class="ref">说明：{_e(report.note)}</p>')
+    for block in report.blocks:
+        parts += _html_llm_block(block)
+    return parts
+
+
+def _html_llm_block(block: LlmBlock) -> List[str]:
+    parts = [
+        '<div class="card ai">',
+        f"<h3>{_e(block.label)} {_e(block.title)} "
+        f'<span class="ref"><code>source: {_e(block.source)}</code></span></h3>',
+        f'<p class="ref">状态：<strong>{_e(block.status)}</strong>　|　本块调用 {block.calls} 次　|　'
+        f"模型 <code>{_e(block.model or '—')}</code></p>",
+    ]
+    if block.items:
+        parts.append("<ol>")
+        for item in block.items:
+            parts.append(f"<li>{_e(item.get('question', ''))}")
+            extra = []
+            if item.get("target"):
+                extra.append(f"追问点：{_e(item['target'])}")
+            if item.get("prepare"):
+                extra.append(f"怎么准备：{_e(item['prepare'])}")
+            if extra:
+                parts.append(f'<br><span class="ref">{"　|　".join(extra)}</span>')
+            parts.append("</li>")
+        parts.append("</ol>")
+    if block.text:
+        parts.append(f"<p>{_e(block.text)}</p>")
+    if block.error:
+        parts.append(f'<p class="ref">{_e(block.error)}</p>')
+    for note in block.notes:
+        parts.append(f'<p class="ref">{_e(note)}</p>')
+    parts.append("</div>")
     return parts
 
 
 def _html_question(state: AgentState) -> List[str]:
     last = state.trace[-1] if state.trace else None
     return [
-        "<h2>一、需要你回答一个问题</h2>",
+        f"<h2>{_sections(state)['verdict']}、需要你回答一个问题</h2>",
         '<div class="card ask">',
         f"<h3>{_e(state.question)}</h3>",
         f"<p>为什么问：{_e(state.question_reason)}</p>",
@@ -200,7 +332,7 @@ def _html_question(state: AgentState) -> List[str]:
 
 
 def _html_evidence(state: AgentState) -> List[str]:
-    parts = ["<h2>二、岗位要求 vs 项目证据</h2>"]
+    parts = [f"<h2>{_sections(state)['evidence']}、岗位要求 vs 项目证据 {_source_label(SOURCE_RULE)}</h2>"]
     if state.skipped_requirements:
         skipped = "、".join(f"{item.name}（{item.level_label}）" for item in state.skipped_requirements)
         parts.append(f'<p class="ref">项目无法证明、已移出对比的要求：{_e(skipped)}</p>')
@@ -231,7 +363,7 @@ def _html_evidence(state: AgentState) -> List[str]:
 
 
 def _html_trace(state: AgentState) -> List[str]:
-    parts = ["<h2>三、运行 Trace（每一步都可检查）</h2>"]
+    parts = [f"<h2>{_sections(state)['trace']}、运行 Trace（每一步都可检查）</h2>"]
     for step in state.trace:
         parts += [
             '<div class="step">',
@@ -249,7 +381,7 @@ def _html_trace(state: AgentState) -> List[str]:
     return parts
 
 
-def _html_params() -> List[str]:
+def _html_params(state: AgentState) -> List[str]:
     rows = [
         ("证据等级", "有结果＝有量化指标或「已开源 / 已上线」这类交付；有动作＝有搭建 / 实现 / 调试等动词但没有结果；仅提及＝只出现在技术栈里"),
         ("值得写", f"核心要求覆盖 ≥ {COVERAGE_OK:.0%}，且有量化结果，且必备项无缺口"),
@@ -258,7 +390,11 @@ def _html_params() -> List[str]:
         ("提问条件", f"看不出个人贡献 / 与岗位零交集 / 事实少于 {MIN_FACTS} 条 / 没有结果且覆盖 < 50%"),
         ("轮次上限", f"最多 Ask 一轮（max_rounds = {MAX_ROUNDS}），补充后仍不足就给保守结论"),
     ]
-    parts = ["<h2>四、判定口径（全部写死，可直接检查）</h2>", "<table><thead><tr><th>项</th><th>规则</th></tr></thead><tbody>"]
+    rows += _llm_param_rows(state)
+    parts = [
+        f"<h2>{_sections(state)['params']}、判定口径（全部写死，可直接检查）</h2>",
+        "<table><thead><tr><th>项</th><th>规则</th></tr></thead><tbody>",
+    ]
     for key, value in rows:
         parts.append(f"<tr><td>{_e(key)}</td><td>{_e(value)}</td></tr>")
     parts.append("</tbody></table>")
@@ -279,10 +415,14 @@ def render_html(state: AgentState, generated_at: str = "") -> str:
         "<h1>这个项目要不要写进简历？</h1>",
         _html_meta(state, generated_at),
     ]
-    parts += _html_question(state) if state.needs_answer else _html_verdict(state)
+    if state.needs_answer:
+        parts += _html_question(state)
+    else:
+        parts += _html_verdict(state)
+        parts += _html_llm(state)
     parts += _html_evidence(state)
     parts += _html_trace(state)
-    parts += _html_params()
+    parts += _html_params(state)
     parts += ["</body>", "</html>"]
     return "\n".join(parts)
 
@@ -291,7 +431,7 @@ def _md_question(state: AgentState) -> List[str]:
     last = state.trace[-1] if state.trace else None
     return [
         "",
-        "## 一、需要你回答一个问题",
+        f"## {_sections(state)['verdict']}、需要你回答一个问题",
         "",
         f"> {state.question}",
         "",
@@ -308,7 +448,8 @@ def _md_question(state: AgentState) -> List[str]:
 
 
 def _md_evidence(state: AgentState) -> List[str]:
-    lines = ["", "## 二、岗位要求 vs 项目证据", ""]
+    sec = _sections(state)
+    lines = ["", f"## {sec['evidence']}、岗位要求 vs 项目证据 {_source_label(SOURCE_RULE)}", ""]
     if state.skipped_requirements:
         skipped = "、".join(f"{item.name}（{item.level_label}）" for item in state.skipped_requirements)
         lines += [f"> 项目无法证明、已移出对比的要求：{skipped}", ""]
@@ -322,6 +463,8 @@ def _md_evidence(state: AgentState) -> List[str]:
             evidence = "—"
         elif fact.line_no > 0:
             evidence = f"{fact.quote_short}（L{fact.line_no}）"
+        elif fact.source_file.startswith("图片:"):
+            evidence = f"{fact.quote_short}（{fact.source_file}）"
         else:
             evidence = f"{fact.quote_short}（补充说明）"
         note = match.note
@@ -350,7 +493,7 @@ def _md_evidence(state: AgentState) -> List[str]:
 def _md_trace(state: AgentState) -> List[str]:
     lines = [
         "",
-        "## 三、运行 Trace（每一步都可检查）",
+        f"## {_sections(state)['trace']}、运行 Trace（每一步都可检查）",
         "",
         "| # | Action | Observation（实际看到什么） | State Update（状态怎么变） | Decision（下一步） |",
         "|---|---|---|---|---|",
@@ -360,10 +503,55 @@ def _md_trace(state: AgentState) -> List[str]:
     return lines
 
 
-def _md_params() -> List[str]:
-    return [
+def _llm_param_rows(state: AgentState) -> List[Tuple[str, str]]:
+    """只有真的用了可选层时，才在「判定口径」里补上对应说明。"""
+    rows: List[Tuple[str, str]] = []
+    report = state.llm_report
+    if report is not None:
+        tasks = "、".join(f"{item.title}（{item.source}）" for item in report.blocks)
+        rows.append(
+            (
+                "LLM 装饰层（--llm）",
+                f"只在规则报告生成之后介入，做三件规则做不好的事：{tasks}；"
+                f"每块都带 source 标记，报告里标 [LLM]，与 [规则] 段落严格分开",
+            )
+        )
+        rows.append(
+            (
+                "调用纪律（--llm）",
+                f"单次超时 {report.timeout:g}s、失败重试 {report.retries} 次、"
+                f"一次运行最多 {report.call_limit} 次调用（本次已用 {report.calls} 次）；"
+                "不带 --llm 时这一层完全不创建，也不会读 .env",
+            )
+        )
+        rows.append(
+            (
+                "LLM 不做结论",
+                "模型输出里出现「值得写 / 不建议写」这类档位词的内容会被整块丢弃；"
+                "结论档位、StopReason 与 Decision 只由规则给出",
+            )
+        )
+        rows.append(
+            (
+                "失败可降级（--llm）",
+                "任何一块调用失败只显示「未启用 / 调用失败」，规则报告、Trace 与退出码不受影响",
+            )
+        )
+    if state.vision.enabled:
+        rows.append(
+            (
+                "图片解析（--vision）",
+                f"由 {state.vision.model} 把引用的图片读成文字事实（source_file = 「图片:相对路径」），"
+                "证据等级仍由 classify() 判定，解析结果需人工复核",
+            )
+        )
+    return rows
+
+
+def _md_params(state: AgentState) -> List[str]:
+    lines = [
         "",
-        "## 四、判定口径（全部写死，可直接检查）",
+        f"## {_sections(state)['params']}、判定口径（全部写死，可直接检查）",
         "",
         "| 项 | 规则 |",
         "|---|---|",
@@ -374,6 +562,8 @@ def _md_params() -> List[str]:
         f"| 提问条件 | 看不出个人贡献 / 与岗位零交集 / 事实少于 {MIN_FACTS} 条 / 没有结果且覆盖 < 50% |",
         f"| 轮次上限 | 最多 Ask 一轮（max_rounds = {MAX_ROUNDS}），补充后仍不足就给保守结论 |",
     ]
+    lines += [f"| {key} | {value} |" for key, value in _llm_param_rows(state)]
+    return lines
 
 
 # ---- JSON ------------------------------------------------------------------
@@ -404,6 +594,8 @@ def build_payload(state: AgentState, generated_at: str = "") -> Dict:
                     "text": fact.text,
                     "section": fact.section,
                     "line_no": fact.line_no,
+                    "source_file": fact.source_file,
+                    "ref": fact.ref,
                     "level": fact.level,
                     "metrics": fact.metrics,
                     "capabilities": fact.capabilities,
@@ -412,6 +604,19 @@ def build_payload(state: AgentState, generated_at: str = "") -> Dict:
                 for fact in state.project.facts
             ],
         },
+        "vision": {
+            "enabled": state.vision.enabled,
+            "model": state.vision.model,
+            "parsed": state.vision.parsed,
+            "facts_added": state.vision.facts_added,
+            "error": state.vision.error,
+            "notes": state.vision.notes,
+            "images": [
+                {"raw": item.raw, "path": item.path, "ref": item.ref, "line_no": item.line_no}
+                for item in state.vision.images
+            ],
+        },
+        "llm": _llm_payload(state),
         "core_requirements": [
             {
                 "name": item.name,
@@ -464,6 +669,7 @@ def build_payload(state: AgentState, generated_at: str = "") -> Dict:
             "risks": [{"text": risk.text, "kind": risk.kind, "refs": risk.refs} for risk in verdict.risks],
             "rewrite": verdict.rewrite,
             "stop_reason": verdict.stop_reason,
+            "source": SOURCE_RULE,
         },
         "trace": [
             {
@@ -481,8 +687,60 @@ def build_payload(state: AgentState, generated_at: str = "") -> Dict:
             "min_facts": MIN_FACTS,
             "coverage_ok": COVERAGE_OK,
             "coverage_min": COVERAGE_MIN,
+            "llm": state.llm_report is not None,
+            "llm_calls": _llm_stat(state, "calls"),
+            "llm_call_limit": _llm_stat(state, "call_limit"),
+            "llm_timeout": _llm_stat(state, "timeout"),
+            "llm_retries": _llm_stat(state, "retries"),
+            "llm_blocks": _llm_status_map(state),
+            "vision": state.vision.enabled,
         },
     }
+
+
+def _llm_payload(state: AgentState) -> Optional[Dict]:
+    """LLM 装饰层的结构化输出；不带 --llm 时是 None（与 v1.0 的 JSON 完全一致）。"""
+    report = state.llm_report
+    if report is None:
+        return None
+    return {
+        "enabled": report.enabled,
+        "model": report.model,
+        "calls": report.calls,
+        "call_limit": report.call_limit,
+        "timeout": report.timeout,
+        "retries": report.retries,
+        "note": report.note,
+        "ok_count": report.ok_count,
+        "blocks": [
+            {
+                "source": item.source,
+                "label": item.label,
+                "title": item.title,
+                "status": item.status,
+                "model": item.model,
+                "calls": item.calls,
+                "text": item.text,
+                "items": item.items,
+                "error": item.error,
+                "failed": item.failed,
+                "discarded": item.discarded,
+                "notes": item.notes,
+                "note": "模型生成，不是判定依据；规则结论见 verdict",
+            }
+            for item in report.blocks
+        ],
+    }
+
+
+def _llm_status_map(state: AgentState) -> Dict[str, str]:
+    report = state.llm_report
+    return {item.source: item.status for item in report.blocks} if report else {}
+
+
+def _llm_stat(state: AgentState, name: str):
+    report = state.llm_report
+    return getattr(report, name) if report else None
 
 
 def render_json(state: AgentState, generated_at: str = "") -> str:
@@ -514,7 +772,7 @@ def render_console(state: AgentState) -> List[str]:
     elif state.verdict:
         verdict = state.verdict
         lines += [
-            f"结论：{verdict.call}",
+            f"结论 {_source_label(SOURCE_RULE)}：{verdict.call}",
             "=" * 72,
             f"  {verdict.headline}",
             "",
@@ -528,5 +786,33 @@ def render_console(state: AgentState) -> List[str]:
             lines.append(f"  - [{risk.kind}] {risk.text}")
         if verdict.rewrite:
             lines += ["", f"建议写法：{verdict.rewrite}"]
+        lines += _console_llm(state)
         lines += ["", f"StopReason：{verdict.stop_reason}"]
+    return lines
+
+
+def _console_llm(state: AgentState) -> List[str]:
+    """LLM 装饰层（可选）：三个块各一行小标题，逐块标 [LLM] 与 source。"""
+    report = state.llm_report
+    if report is None or report.is_empty:
+        return []
+    lines = [
+        "",
+        f"LLM 生成内容（报告已生成之后追加，不是判定依据；模型 {report.model or '未指定'}，"
+        f"调用 {report.calls}/{report.call_limit} 次，超时 {report.timeout:g}s，重试 {report.retries} 次）：",
+    ]
+    if report.note:
+        lines.append(f"  说明：{report.note}")
+    for block in report.blocks:
+        lines.append(f"  {block.label} {block.title}（source: {block.source}｜状态：{block.status}）：")
+        for index, item in enumerate(block.items, start=1):
+            lines.append(f"    {index}. {item.get('question', '')}")
+            if item.get("target"):
+                lines.append(f"       追问点：{item['target']}")
+            if item.get("prepare"):
+                lines.append(f"       怎么准备：{item['prepare']}")
+        if block.text:
+            lines.append(f"    {block.text}")
+        if block.error:
+            lines.append(f"    （{block.error}；以上结论、理由与风险仍全部来自规则）")
     return lines
