@@ -52,7 +52,7 @@ v2.4 加了 **分层记忆与知识库**：记忆分 L0 会话 / L1 短时 / L2 
 
 ### 在 PyCharm 里
 
-1. `File > Open` → 选择项目目录 `D:\codexAbout\projects\AI_Job_Research_Agent`
+1. `File > Open` → 选择你克隆下来的项目目录
 2. 解释器选任意 Python 3.9+，然后 `pip install -r requirements.txt`（python-dotenv + langgraph）
 3. 右键 `main.py` → **Run 'main'**（不指定 `--jd` 时会把 `input/jd` 下所有岗位各跑一遍）
 4. 结果写在 `output/`：单个岗位是 `resume_decision.md｜json｜html`，多个岗位按岗位分文件
@@ -60,7 +60,7 @@ v2.4 加了 **分层记忆与知识库**：记忆分 L0 会话 / L1 短时 / L2 
 ### 命令行
 
 ```bash
-cd D:\codexAbout\projects\AI_Job_Research_Agent
+cd path\to\AI_Job_Research_Agent
 python main.py                                     # 不指定 --jd：跑完 input/jd 下所有文件的全部岗位
 python main.py --jd input/jd/xx.md                 # 只跑这个文件（文件里多个岗位时默认只跑第一个）
 python main.py --jd input/jd/xx.md --jd-title 岗位二   # 指定这个文件里的哪个岗位
@@ -689,7 +689,7 @@ python main.py --vision             # 额外解析项目描述里引用的图片
 python main.py --llm --vision       # 两个都开
 python main.py --vision --image D:\shots\dashboard.png          # 再补一张描述里没引用的图
 python main.py --llm --text-model deepseek-reasoner --vision-model qwen-vl-plus   # 换模型
-python main.py --llm --env D:\secrets\my.env                    # 换 .env 的位置
+python main.py --llm --env ./my.env                            # 换 .env 的位置
 ```
 
 `--check-llm` 给每个启用的层发一条最小请求：通过返回 `0`，失败返回 `2` 并原样打印接口的报错。
@@ -771,7 +771,7 @@ python main.py --jd input/jd/后端开发工程师-岗位描述.md
 
 ```bash
 python main.py --build-resume                            # 默认取 input/profile 下第一个非「示例」文件
-python main.py --build-resume --resume-file input/profile/个人简历1.md
+python main.py --build-resume --resume-file input/profile/示例简历-可替换.md
 python main.py --build-resume --resume-style structure    # 换一套风格 → output/resume-structure.md / .html
 python main.py --build-resume --resume-format html        # 只要 html（md,html 可用逗号组合）
 python main.py --build-resume --resume-name 我的简历       # 改文件名 → output/我的简历.md / .html

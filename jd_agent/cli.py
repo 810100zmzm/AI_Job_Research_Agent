@@ -9,7 +9,7 @@
 简历排版工具（纯规则、不联网、不调用大模型；三套风格 classic / structure / accent）：
     python main.py --build-resume                    # 把 input/profile 下的简历排成 output/resume.md + .html
     python main.py --build-resume --resume-style structure   # 换风格 → output/resume-structure.md + .html
-    python main.py --build-resume --resume-file input/profile/个人简历1.md
+    python main.py --build-resume --resume-file input/profile/示例简历-可替换.md
     python main.py --build-resume --resume-project input/project/示例项目1-AI周报助手.md
 
 JD Agent（LangGraph）：把 JD（文本 / 图片 / 网址）转成统一模板的 Markdown：

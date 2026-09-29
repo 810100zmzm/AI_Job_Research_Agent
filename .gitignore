@@ -3,12 +3,31 @@ __pycache__/
 .idea/
 .venv/
 venv/
+marker_env/
 .env
 .env.local
-output/*.md
-output/*.json
-output/*.html
+.env.*
+!.env.example
+!**/.env.example
+*.log
+.streamlit/secrets.toml
+*.pem
+*.key
+*.p12
+*.pfx
+output/*
 !output/.gitkeep
 
 # 记忆 / 知识库运行时数据；默认只落在项目盘 data/ 下。
 data/
+knowledge/*
+!knowledge/.gitkeep
+
+# 个人简历只保留公开示例；其余本地材料不进入仓库。
+input/profile/*
+!input/profile/示例简历-可替换.md
+!input/profile/资料不足项目测试简历1.md
+
+# 前端依赖与构建产物。
+frontend/node_modules/
+frontend/dist/
