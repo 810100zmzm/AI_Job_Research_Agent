@@ -1,9 +1,25 @@
-# 唯一的依赖：python-dotenv，用来读项目根目录的 .env（需要 Python 3.9+）。
+# 规则主链路（不指定 --jd-agent 的用法）只需要 python-dotenv，用来读项目根目录的 .env（需要 Python 3.9+）。
 python-dotenv>=1.0
+
+# JD Agent（--jd-agent）与 Resume Agent（--resume-agent）用 LangGraph 编排两条链：
+# 「文本 / 图片 / 网址 -> JD Markdown」与「文本 / 文件 / 图片 / 网址 -> 简历事实条目 + 证据等级」。
+# Polish Agent（--polish-agent）是第三条链：把上面两条链的结果合起来，基于「已核验事实 + JD 要求」
+# 生成建议写法 / 追问预演 / 润色（这三块要文本层 key；规则部分照出不联网）。
+# 没装也能跑其它模式：只有这三个 Agent 模式会提示去装（pip install langgraph）。
+langgraph>=1.0
 
 # 可选依赖：网页版前端（python -m streamlit run streamlit_app.py）。
 # 只用命令行的话不必装；要装就执行：pip install "streamlit>=1.49"
 # streamlit>=1.49
+
+# FastAPI 后端：uvicorn jd_agent.api.app:app --reload
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.12
+
+# 可选依赖：记忆 / 知识库后端。默认 JSONL + 本地哈希嵌入，不需要这些包。
+# pip install pymongo       # MONGODB_URI 长时记忆
+# pip install qdrant-client # QDRANT_URL 知识索引
 
 # 两路 HTTPS 调用仍然走标准库 urllib，不需要 openai / requests 这类 SDK。
 # 不加 --llm / --vision / --check-llm 时不会加载 .env，也不会发任何网络请求。

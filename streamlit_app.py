@@ -4,16 +4,17 @@
     .venv\\Scripts\\python.exe -m streamlit run streamlit_app.py
 
 三条与主流程一致的设计约束：
-  * 渲染复用 jd_agent.render —— 网页里的 Markdown / JSON / HTML 与命令行产物同源，前端不重写判定逻辑；
+  * 渲染复用 jd_agent.agents.render —— 网页里的 Markdown / JSON / HTML 与命令行产物同源，前端不重写判定逻辑；
   * 大模型与图片解析都是显式开关，默认关闭；开启会联网，失败只降级成一块「调用失败」的说明；
-  * 前端不往磁盘写任何东西：下载走内存，报告要落盘请用命令行（python main.py）。
+  * 记忆、知识库、大模型与图片解析都是显式开关；只有开启记忆或知识库时才写项目 data/ 目录。
 """
 from __future__ import annotations
 
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import streamlit as st
 
@@ -22,26 +23,30 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from jd_agent import tools  # noqa: E402
-from jd_agent.agent import MAX_ROUNDS, build_text_budget, run_agent  # noqa: E402
+from jd_agent.agents.agent import MAX_ROUNDS, build_text_budget, run_agent  # noqa: E402
 from jd_agent.cli import INPUT_DIR, JD_DIR, PROJECT_DIR, RESUME_DIR, report_stem  # noqa: E402
-from jd_agent.jd import load_jd, load_jd_positions  # noqa: E402
-from jd_agent.llm import DEFAULT_CALL_LIMIT  # noqa: E402
-from jd_agent.render import render_html, render_json, render_markdown  # noqa: E402
-from jd_agent.schema import (  # noqa: E402
+from jd_agent.domain.jd import load_jd, load_jd_positions  # noqa: E402
+from jd_agent.core.llm import DEFAULT_CALL_LIMIT  # noqa: E402
+from jd_agent.agents.render import render_html, render_json, render_markdown  # noqa: E402
+from jd_agent.knowledge import KNOWLEDGE_TIERS, TIER_LABELS, KnowledgeBase, build_knowledge_base  # noqa: E402
+from jd_agent.memory import MemoryManager, build_memory_manager  # noqa: E402
+from jd_agent.core.schema import (  # noqa: E402
     VERDICT_EDIT,
     VERDICT_NO,
     VERDICT_YES,
     AgentState,
     JobPosting,
 )
-from jd_agent.settings import DEFAULT_ENV_FILE, LLMSettings, load_env, resolve_settings  # noqa: E402
+from jd_agent.core.settings import DEFAULT_ENV_FILE, LLMSettings, load_env, resolve_settings  # noqa: E402
+from jd_agent.core.settings import StorageSettings, resolve_storage_settings  # noqa: E402
 
 st.set_page_config(page_title="AI 求职尽调 Agent", page_icon=":material/analytics:", layout="wide")
+st.session_state.setdefault("context_session_id", f"web-{uuid.uuid4().hex[:12]}")
 
 VERDICT_BADGE = {VERDICT_YES: "green", VERDICT_EDIT: "orange", VERDICT_NO: "red"}
 
 
-# ---- 只读的数据加载（缓存，不写盘） -----------------------------------------
+# ---- 输入加载与可选上下文资源缓存 -------------------------------------------
 
 
 def md_files(directory: Path) -> List[str]:
@@ -88,6 +93,91 @@ def env_settings() -> LLMSettings:
 
 
 @st.cache_data(show_spinner=False)
+def context_settings() -> StorageSettings:
+    """Read optional memory / knowledge settings only when those features are on."""
+    load_env(DEFAULT_ENV_FILE)
+    return resolve_storage_settings()
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def memory_store(
+    data_dir: str,
+    ttl_seconds: int,
+    max_items: int,
+    long_term_backend: str,
+    mongodb_uri: str,
+    mongodb_database: str,
+) -> MemoryManager:
+    return build_memory_manager(
+        Path(data_dir),
+        short_term_ttl_seconds=ttl_seconds,
+        short_term_max_items=max_items,
+        long_term_backend=long_term_backend,
+        mongodb_uri=mongodb_uri,
+        mongodb_database=mongodb_database,
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def knowledge_store(
+    data_dir: str,
+    embedding_backend: str,
+    embedding_api_key: str,
+    embedding_base_url: str,
+    embedding_model: str,
+    embedding_dimensions: int,
+    index_backend: str,
+    qdrant_url: str,
+    qdrant_api_key: str,
+    qdrant_collection: str,
+) -> KnowledgeBase:
+    return build_knowledge_base(
+        Path(data_dir),
+        embedding_backend=embedding_backend,
+        embedding_api_key=embedding_api_key,
+        embedding_base_url=embedding_base_url,
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+        index_backend=index_backend,
+        qdrant_url=qdrant_url,
+        qdrant_api_key=qdrant_api_key,
+        qdrant_collection=qdrant_collection,
+    )
+
+
+def resolve_context_stores(options: dict) -> Tuple[Optional[MemoryManager], Optional[KnowledgeBase]]:
+    """Build process-wide stores; per-session separation happens through session_id."""
+    if not options.get("memory") and not options.get("knowledge"):
+        return None, None
+    settings = context_settings()
+    memory = None
+    knowledge = None
+    if options.get("memory"):
+        memory = memory_store(
+            str(settings.data_dir),
+            settings.l1_ttl_seconds,
+            settings.l1_max_items,
+            settings.long_term_backend,
+            settings.mongodb_uri,
+            settings.mongodb_database,
+        )
+    if options.get("knowledge"):
+        knowledge = knowledge_store(
+            str(settings.data_dir),
+            settings.embedding_backend,
+            settings.embedding_api_key,
+            settings.embedding_base_url,
+            settings.embedding_model,
+            settings.embedding_dimensions,
+            settings.index_backend,
+            settings.qdrant_url,
+            settings.qdrant_api_key,
+            settings.qdrant_collection,
+        )
+    return memory, knowledge
+
+
+@st.cache_data(show_spinner=False)
 def build_resume_cached(resume_file: str, merges: Tuple[str, ...], style: str, stamp: str) -> tools.Resume:
     """stamp（文件 mtime）只用来让缓存失效；换风格要重排，所以 style 也进缓存 key。"""
     return tools.build_resume(Path(resume_file), [Path(item) for item in merges], style=style)
@@ -114,7 +204,17 @@ def pick_inputs() -> Tuple[List[Tuple[Path, JobPosting]], str, dict]:
     """返回 (待分析的岗位列表, 项目描述路径, 开关字典)。"""
     jd_file_list = md_files(JD_DIR)
     candidates = input_candidates()
-    options = {"llm": False, "vision": False, "llm_max_calls": DEFAULT_CALL_LIMIT, "max_rounds": MAX_ROUNDS}
+    options = {
+        "llm": False,
+        "vision": False,
+        "llm_max_calls": DEFAULT_CALL_LIMIT,
+        "max_rounds": MAX_ROUNDS,
+        "memory": False,
+        "knowledge": False,
+        "index_knowledge": False,
+        "knowledge_tiers": KNOWLEDGE_TIERS,
+        "session_id": st.session_state["context_session_id"],
+    }
 
     with st.sidebar:
         st.markdown("#### 输入")
@@ -171,12 +271,45 @@ def pick_inputs() -> Tuple[List[Tuple[Path, JobPosting]], str, dict]:
         options["max_rounds"] = int(
             st.number_input("最多检索轮数", min_value=1, max_value=5, value=MAX_ROUNDS, step=1)
         )
+
+        st.markdown("#### 记忆与知识库")
+        options["memory"] = st.toggle(
+            "启用 L0 / L1 / L2 记忆",
+            value=False,
+            help="L0 会话与 L1 短时记忆保留在进程内；L2 长时记忆写入项目 data/。",
+        )
+        options["knowledge"] = st.toggle(
+            "启用分层知识库检索",
+            value=False,
+            help="检索结果只作为补充上下文，不参与规则结论和 Decision。",
+        )
+        selected_tiers = st.multiselect(
+            "检索层级",
+            list(KNOWLEDGE_TIERS),
+            default=list(KNOWLEDGE_TIERS),
+            format_func=lambda tier: TIER_LABELS.get(tier, tier),
+            disabled=not options["knowledge"],
+            help="不选时按全部层级检索。L1 静态 / L2 半静态 / L3 动态。",
+        )
+        if options["knowledge"] and not selected_tiers:
+            st.caption("未选择层级：本次按全部层级检索。")
+        options["knowledge_tiers"] = tuple(selected_tiers)
+        options["index_knowledge"] = st.toggle(
+            "运行前增量索引",
+            value=False,
+            disabled=not options["knowledge"],
+            help="按 L1 knowledge/、L2 input/、L3 output/ 增量更新，只处理内容有变化的文件。",
+        )
+        if options["memory"] or options["knowledge"]:
+            st.caption(f"数据目录：{context_settings().data_dir}")
+            st.caption(f"会话 ID：{options['session_id']}")
+
         options["run"] = st.button("开始分析", type="primary", icon=":material/play_arrow:", width="stretch")
 
     return selected, project, options
 
 
-# ---- 跑一遍 Agent（只读，不写盘） --------------------------------------------
+# ---- 跑一遍 Agent（是否写盘取决于记忆 / 知识库开关） ----------------------------
 
 
 def run_one(
@@ -186,6 +319,8 @@ def run_one(
     options: dict,
     answer: str = "",
     budget=None,
+    memory: Optional[MemoryManager] = None,
+    knowledge: Optional[KnowledgeBase] = None,
 ) -> AgentState:
     """跑一个岗位；answer 非空时先把回答并入证据池，再重新检索与判定。"""
     return run_agent(
@@ -199,11 +334,19 @@ def run_one(
         settings=env_settings() if (options["llm"] or options["vision"]) else None,
         posting=posting,
         llm_budget=budget,
+        memory=memory,
+        knowledge=knowledge,
+        session_id=options["session_id"],
+        knowledge_tiers=options["knowledge_tiers"],
     )
 
 
 def run_selected(
-    selected: Sequence[Tuple[Path, JobPosting]], project: str, options: dict
+    selected: Sequence[Tuple[Path, JobPosting]],
+    project: str,
+    options: dict,
+    memory: Optional[MemoryManager] = None,
+    knowledge: Optional[KnowledgeBase] = None,
 ) -> List[Tuple[JobPosting, AgentState, str]]:
     settings = env_settings() if (options["llm"] or options["vision"]) else None
     budget = None
@@ -220,7 +363,15 @@ def run_selected(
     progress = st.progress(0.0, text="正在跑规则流程……")
     results: List[Tuple[JobPosting, AgentState, str]] = []
     for index, (jd_path, posting) in enumerate(selected, start=1):
-        state = run_one(jd_path, posting, project, options, budget=budget)
+        state = run_one(
+            jd_path,
+            posting,
+            project,
+            options,
+            budget=budget,
+            memory=memory,
+            knowledge=knowledge,
+        )
         results.append((posting, state, stamp))
         progress.progress(index / total, text=f"已分析 {index}/{total}：{posting.title}")
     progress.empty()
@@ -237,7 +388,20 @@ def apply_answer(index: int, answer: str) -> None:
         return
     jd_path = analysis["selected"][index - 1][0]
     posting = analysis["results"][index - 1][0]
-    state = run_one(jd_path, posting, analysis["project"], analysis["options"], answer=answer)
+    try:
+        memory, knowledge = resolve_context_stores(analysis["options"])
+    except Exception as exc:
+        st.error(f"记忆 / 知识库初始化失败：{exc.__class__.__name__}: {exc}")
+        return
+    state = run_one(
+        jd_path,
+        posting,
+        analysis["project"],
+        analysis["options"],
+        answer=answer,
+        memory=memory,
+        knowledge=knowledge,
+    )
     analysis["results"][index - 1] = (posting, state, analysis["stamp"])
     st.session_state["analysis"] = analysis
     st.rerun()
@@ -268,6 +432,21 @@ def _render_verdict(state: AgentState) -> None:
         st.markdown("**建议写法 · [规则]**")
         st.write(verdict.rewrite)
     st.caption(f"StopReason：{verdict.stop_reason}")
+
+
+def _render_context(state: AgentState) -> None:
+    if state.context.empty:
+        return
+    total = len(state.context.memory) + len(state.context.knowledge)
+    with st.expander(f"记忆与知识库补充（{total} 条 · 不参与判定）", icon=":material/database:"):
+        st.caption("这些内容只进入 state.context；结论、理由、风险与 Decision 仍只由规则证据产生。")
+        for label, items in (("记忆", state.context.memory), ("知识库", state.context.knowledge)):
+            if not items:
+                continue
+            st.markdown(f"**{label}**")
+            for item in items:
+                st.markdown(f"- `{item.source}` · score {item.score:.3f}")
+                st.caption(item.text)
 
 
 def _render_llm(state: AgentState) -> None:
@@ -365,6 +544,7 @@ def render_result(posting: JobPosting, state: AgentState, stamp: str, index: int
             _render_verdict(state)
             _render_llm(state)
     _render_evidence(state)
+    _render_context(state)
     _render_trace(state)
 
     stem = report_stem(posting, total)
@@ -455,15 +635,25 @@ def main() -> None:
         if not selected or not project:
             st.error("先选好 JD 与项目描述 md。", icon=":material/error:")
         else:
-            results = run_selected(selected, project, options)
-            # 存下这次运行的全部输入，Ask 分支要在页面上重跑（等价于命令行的 --answer）
-            st.session_state["analysis"] = {
-                "results": results,
-                "selected": list(selected),
-                "project": project,
-                "options": options,
-                "stamp": results[0][2] if results else datetime.now().strftime("%Y-%m-%d %H:%M"),
-            }
+            try:
+                memory, knowledge = resolve_context_stores(options)
+                if options["index_knowledge"] and knowledge is not None:
+                    with st.spinner("正在更新分层知识索引……"):
+                        changed = knowledge.ensure_default_index(ROOT)
+                    st.toast(f"知识索引完成：写入 / 更新 {changed} 个切片", icon=":material/database:")
+                with st.spinner("正在跑规则流程与可选上下文检索……"):
+                    results = run_selected(selected, project, options, memory=memory, knowledge=knowledge)
+            except Exception as exc:
+                st.error(f"记忆 / 知识库初始化失败：{exc.__class__.__name__}: {exc}")
+            else:
+                # 存下这次运行的全部输入，Ask 分支要在页面上重跑（等价于命令行的 --answer）
+                st.session_state["analysis"] = {
+                    "results": results,
+                    "selected": list(selected),
+                    "project": project,
+                    "options": options,
+                    "stamp": results[0][2] if results else datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
 
     analysis, resume = st.tabs(["分析结果", "简历排版"])
     with analysis:

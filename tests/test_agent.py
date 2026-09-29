@@ -15,11 +15,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from jd_agent import cli  # noqa: E402
-from jd_agent.agent import run_agent  # noqa: E402
-from jd_agent.evidence import match_requirements  # noqa: E402
-from jd_agent.jd import load_jd, parse_jd_text  # noqa: E402
-from jd_agent.project import load_project, parse_project_text  # noqa: E402
-from jd_agent.schema import (  # noqa: E402
+from jd_agent.agents.agent import run_agent  # noqa: E402
+from jd_agent.domain.evidence import match_requirements  # noqa: E402
+from jd_agent.domain.jd import load_jd, parse_jd_text  # noqa: E402
+from jd_agent.domain.project import load_project, parse_project_text  # noqa: E402
+from jd_agent.core.schema import (  # noqa: E402
     DECISION_ASK,
     DECISION_STOP,
     DECISIONS,

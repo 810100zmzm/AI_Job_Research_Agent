@@ -6,8 +6,8 @@ Markdown 本身没有排版能力，所以一套风格由两部分组成：
 
 | key | 名字 | 适合场景 |
 |-----|------|----------|
-| classic | 经典简约 | 通用；细灰线 + 无衬线，粘到投递平台最稳。默认风格，输出与 v1.1 逐字一致 |
-| compact | 紧凑一页 | 内容多、想压到一页；字号与行距更紧，章节标题带浅底（只换 CSS，不动 Markdown） |
+| classic | 经典简约 | 通用；细灰线 + 无衬线，粘到投递平台最稳。默认风格 |
+| structure | 架构清晰 | 层级分明、模块分区；奖项荣誉双列展示，一眼看清结构 |
 | accent  | 强调竖线 | 想要一点设计感；章节标题带竖线，表格去掉竖格线，章节间加 `---`、子条目加粗 |
 """
 from __future__ import annotations
@@ -61,20 +61,40 @@ CLASSIC_CSS = """
 .resume-doc h2 { padding-bottom: 5px; border-bottom: 1px solid var(--line); }
 """
 
-# 紧凑一页：整体收小，章节标题带浅底块
-COMPACT_CSS = """
-.resume-doc { max-width: 800px; padding: 30px 22px 40px; line-height: 1.6; font-size: 13px; }
-.resume-doc h1 { font-size: 24px; margin: 0 0 6px; }
-.resume-doc .tagline { font-size: 12.5px; }
-.resume-doc section { margin-top: 20px; }
-.resume-doc h2 { font-size: 14px; letter-spacing: 1px; margin: 0 0 8px; padding: 4px 8px;
-                 background: #f2f4f7; border-radius: 4px; }
-.resume-doc h3 { font-size: 14px; margin: 12px 0 4px; }
-.resume-doc p, .resume-doc ul { margin: 4px 0; }
-.resume-doc li { margin: 2px 0; }
-.resume-doc table { font-size: 12.5px; margin: 8px 0 10px; }
-.resume-doc th, .resume-doc td { padding: 4px 7px; }
-@media print { .resume-doc { font-size: 10.5pt; } }
+# 架构清晰：章节标题带左侧色条 + 浅底色块，子条目层级分明，表格分区更规整
+# 「奖项荣誉」章节采用双列布局（两列卡片），一屏看清全部获奖
+STRUCTURE_CSS = """
+.resume-doc { max-width: 840px; padding: 34px 26px 52px; line-height: 1.66; font-size: 14px; }
+.resume-doc header { border-bottom: 2px solid var(--accent); }
+.resume-doc h2 { display: flex; align-items: center; gap: 8px; font-size: 16px; letter-spacing: 1px;
+                 margin: 0 0 10px; padding: 5px 10px; background: #eef2f7; border-radius: 4px;
+                 border-left: 4px solid var(--accent); }
+.resume-doc h3 { font-size: 14.5px; margin: 14px 0 5px; padding-left: 10px;
+                 border-left: 3px solid var(--line); }
+.resume-doc p, .resume-doc ul { margin: 5px 0; }
+.resume-doc li { margin: 2.5px 0; }
+.resume-doc table { font-size: 13px; margin: 9px 0 12px; }
+.resume-doc th, .resume-doc td { padding: 5px 8px; }
+.resume-doc th { background: #eef2f7; }
+.resume-doc blockquote { border-left-color: var(--accent); background: #f8fafc; padding: 4px 12px; }
+
+/* 「奖项荣誉」双列：两列自适应，窄屏自动降为单列 */
+.resume-doc section.awards ul {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px 22px; padding-left: 0; list-style: none;
+}
+.resume-doc section.awards li {
+    position: relative; padding: 3px 0 3px 16px; margin: 0;
+    border-bottom: 1px dashed var(--line); break-inside: avoid;
+}
+.resume-doc section.awards li::before {
+    content: ""; position: absolute; left: 2px; top: 11px;
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+}
+@media (max-width: 640px) {
+  .resume-doc section.awards ul { grid-template-columns: 1fr; }
+}
+@media print { .resume-doc { font-size: 11pt; } }
 """
 
 # 强调竖线：章节标题带色条，表格去掉竖格线，求职意向做成一条浅底色块
@@ -116,15 +136,15 @@ STYLES: Tuple[ResumeStyle, ...] = (
     ResumeStyle(
         key="classic",
         name="经典简约",
-        summary="细灰线 + 无衬线，通用；粘到投递平台最稳（默认，输出与 v1.1 逐字一致）",
+        summary="细灰线 + 无衬线，通用排版；粘到投递平台最稳（默认）",
         css=BASE_CSS + CLASSIC_CSS,
         rule_between_sections=False,
     ),
     ResumeStyle(
-        key="compact",
-        name="紧凑一页",
-        summary="字号与行距更紧、章节标题带浅底块，内容多时压到一页（只换样式，不改 Markdown）",
-        css=BASE_CSS + COMPACT_CSS,
+        key="structure",
+        name="架构清晰",
+        summary="章节标题带编号底色块、子条目层级分明，奖项荣誉双列展示，一眼看清结构",
+        css=BASE_CSS + STRUCTURE_CSS,
         rule_between_sections=False,
     ),
     ResumeStyle(

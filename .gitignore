@@ -9,3 +9,6 @@ output/*.md
 output/*.json
 output/*.html
 !output/.gitkeep
+
+# 记忆 / 知识库运行时数据；默认只落在项目盘 data/ 下。
+data/

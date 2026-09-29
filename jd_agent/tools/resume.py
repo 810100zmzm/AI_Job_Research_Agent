@@ -1,7 +1,7 @@
 """简历排版工具：把手写的简历 Markdown 重排成「简约大方」的 Markdown / HTML。
 
 命令行（jd_agent/cli.py）与 Streamlit 前端（streamlit_app.py）共用这一份实现：
-    python main.py --build-resume [--resume-style classic|compact|accent] [--resume-file ...]
+    python main.py --build-resume [--resume-style classic|structure|accent] [--resume-file ...]
 
 工具类 `ResumeTool` 负责「解析 + 校验 + 落盘」，给命令行用；页面只调下面的纯函数，
 不写磁盘。两者都只做规则，不联网、不读 .env、不调用大模型。
@@ -17,14 +17,14 @@
     * HTML     —— 内嵌 CSS、A4 宽度、无外链，浏览器里可直接打印成 PDF。
 
 排版规则（纯规则，全部写在这里，可直接检查）：
-    1. 章节顺序按模板固定（基本信息 / 教育背景 / 技能清单 / 项目经历 / 实习经历 /
-       荣誉奖项 / 竞赛与获奖 / 校园经历 / 自我评价），没写的章节不出现，
+    1. 章节顺序按模板固定（教育背景 / 项目经历 / 实习经历 / 专业技能 /
+       奖项荣誉 / 竞赛与获奖 / 校园经历 / 自我评价），没写的章节不出现，
        文件里多出来的章节按原顺序排在后面；
     2. 列表统一成 `- `；段落之间只留一个空行；行尾空白与重复空格清掉；
     3. 表格按最大列数补齐，分隔行统一成 `| --- |`，单元格里的 `|` 换成全角；
     4. 只做结构重排与空白规整：不新增、不改写任何事实，也不判断「该不该写」；
     5. 「怎么排」另由 resume_styles 里的三套风格决定（CSS + 章节分隔线 + 子条目写法）；
-       默认的经典简约与重构前那份 resume_doc.py 的输出逐字一致。
+       默认使用稳定、通用的经典简约排版。
 """
 from __future__ import annotations
 
@@ -34,8 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-from ..jd import display_path, read_text
-from ..project import parse_project_text
+from ..domain.jd import display_path, read_text
+from ..domain.project import parse_project_text
 from .base import Tool, ToolResult
 from .resume_styles import DEFAULT_STYLE, PAGE_CSS, ResumeStyle, get_style
 
@@ -50,18 +50,21 @@ TITLE_SUFFIX_RE = re.compile(r"\s*[·・|｜]\s*(?:个人)?(?:简历|经历|resu
 
 # 章节模板顺序；不在表里的章节按原文顺序排在后面
 SECTION_ORDER = (
-    "基本信息",
     "教育背景",
-    "技能清单",
-    "专业技能",
     "项目经历",
     "实习经历",
-    "工作经历",
+    "专业技能",
+    "技能清单",
+    "奖项荣誉",
     "荣誉奖项",
     "竞赛与获奖",
     "校园经历",
+    "基本信息",
     "自我评价",
 )
+
+# 「奖项荣誉」类章节：structure 风格下走双列布局（HTML 里加 class="awards"）
+AWARD_SECTIONS = ("奖项荣誉", "荣誉奖项", "竞赛与获奖")
 
 @dataclass
 class Table:
@@ -382,6 +385,13 @@ def _node_html(node: Node) -> str:
     return f"<p>{_inline(node.text)}</p>"
 
 
+def _section_class(section: Section, style: ResumeStyle) -> str:
+    """章节附加 class：structure 风格下，奖项荣誉类章节加 `awards`，走双列布局。"""
+    if style.key == "structure" and section.title in AWARD_SECTIONS:
+        return " class=\"awards\""
+    return ""
+
+
 def render_html(resume: Resume, notes: bool = True, standalone: bool = True) -> str:
     """自包含的简历 HTML：内嵌 CSS、A4 宽度、无外链，可直接打印。
 
@@ -408,7 +418,7 @@ def render_html(resume: Resume, notes: bool = True, standalone: bool = True) -> 
         parts.append(f'<p class="tagline">{spans}</p>')
     parts.append("</header>")
     for section in resume.sections:
-        parts.append(f"<section><h2>{_inline(section.title)}</h2>")
+        parts.append(f"<section{_section_class(section, style)}><h2>{_inline(section.title)}</h2>")
         parts += [_node_html(node) for node in section.nodes]
         parts.append("</section>")
     if notes and resume.notes:
@@ -456,7 +466,7 @@ class ResumeTool(Tool):
     title = "简历排版"
     summary = "把简历 md 重排成简约大方的 md / html（三种风格，纯规则、不联网）"
     usage = (
-        "python main.py --build-resume [--resume-style classic|compact|accent] "
+        "python main.py --build-resume [--resume-style classic|structure|accent] "
         "[--resume-file input/profile/我的简历.md] [--resume-project input/project/示例项目1-AI周报助手.md] "
         "[--resume-format md,html] [--resume-name 我的简历] [--out output]"
     )

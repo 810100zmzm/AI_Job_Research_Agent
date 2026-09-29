@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from jd_agent import cli, tools  # noqa: E402
-from jd_agent.jd import load_jd_positions  # noqa: E402
-from jd_agent.schema import STATUS_IDLE, STATUS_OK, STATUS_SKIPPED  # noqa: E402
+from jd_agent.domain.jd import load_jd_positions  # noqa: E402
+from jd_agent.core.schema import STATUS_IDLE, STATUS_OK, STATUS_SKIPPED  # noqa: E402
 
 JD_TWO_POSITIONS = """# 某公司 AI 岗
 
@@ -86,15 +86,15 @@ CLASSIC_MD_BASELINE = (
     "# 周每每\n\n"
     "> 求职意向：**首选 AI 大模型应用开发实习生** ｜ 2027 届本科在读\n"
     "> 可实习 6 个月以上 ｜ 每周 4 天\n\n"
+    "## 项目经历\n\n"
+    "### 智能旅行助手 Agent ｜ 全栈开发\n\n"
+    "**技术栈**：Vue3 + Python\n\n"
+    "- 负责后端接口与多智能体编排，代码已开源。\n\n"
     "## 基本信息\n\n"
     "| 项目 | 内容 |\n"
     "| --- | --- |\n"
     "| 姓名 | 周每每 |\n"
     "| 联系方式 | [手机号] ｜ [邮箱] |\n\n"
-    "## 项目经历\n\n"
-    "### 智能旅行助手 Agent ｜ 全栈开发\n\n"
-    "**技术栈**：Vue3 + Python\n\n"
-    "- 负责后端接口与多智能体编排，代码已开源。\n\n"
     "## 自我评价\n\n"
     "- 踏实细心，执行力好。\n"
 )
@@ -105,18 +105,17 @@ CLASSIC_BODY_BASELINE = """
 <h1>周每每</h1>
 <p class="tagline"><span>求职意向：<strong>首选 AI 大模型应用开发实习生</strong> ｜ 2027 届本科在读</span><span>可实习 6 个月以上 ｜ 每周 4 天</span></p>
 </header>
-<section><h2>基本信息</h2>
-<table><thead><tr><th>项目</th><th>内容</th></tr></thead><tbody><tr><td>姓名</td><td>周每每</td></tr><tr><td>联系方式</td><td>[手机号] ｜ [邮箱]</td></tr></tbody></table>
-</section>
 <section><h2>项目经历</h2>
 <h3>智能旅行助手 Agent ｜ 全栈开发</h3>
 <p><strong>技术栈</strong>：Vue3 + Python</p>
 <ul><li>负责后端接口与多智能体编排，代码已开源。</li></ul>
 </section>
+<section><h2>基本信息</h2>
+<table><thead><tr><th>项目</th><th>内容</th></tr></thead><tbody><tr><td>姓名</td><td>周每每</td></tr><tr><td>联系方式</td><td>[手机号] ｜ [邮箱]</td></tr></tbody></table>
+</section>
 <section><h2>自我评价</h2>
 <ul><li>踏实细心，执行力好。</li></ul>
 </section>
-<div class="notes"><ul><li>章节顺序已按模板重排：基本信息 → 项目经历 → 自我评价</li></ul></div>
 </div>
 </body>
 </html>"""
@@ -281,9 +280,9 @@ class TestResumeParsing(TempCase):
     def test_sections_are_ordered_and_content_is_preserved(self) -> None:
         resume = tools.parse_resume(RESUME, "profile/x.md")
         self.assertEqual(resume.name, "周每每")
-        self.assertEqual(resume.section_titles, ["基本信息", "项目经历", "自我评价"])
+        self.assertEqual(resume.section_titles, ["项目经历", "基本信息", "自我评价"])
         self.assertEqual(resume.tagline[0], "求职意向：**首选 AI 大模型应用开发实习生** ｜ 2027 届本科在读")
-        self.assertIn("章节顺序已按模板重排", resume.notes[0])
+        self.assertFalse(any("章节顺序已按模板重排" in note for note in resume.notes))
 
     def test_markdown_output_is_normalised(self) -> None:
         resume = tools.parse_resume(RESUME, "profile/x.md")
@@ -406,7 +405,7 @@ class TestResumeCli(TempCase):
                 [
                     "--build-resume",
                     "--resume-style",
-                    "compact",
+                    "structure",
                     "--resume-name",
                     "我的简历",
                     "--out",
@@ -416,7 +415,7 @@ class TestResumeCli(TempCase):
             )
         self.assertEqual(code, cli.EXIT_OK)
         self.assertTrue((self.tmp / "named" / "我的简历.md").is_file())
-        self.assertFalse((self.tmp / "named" / "resume-compact.md").exists())
+        self.assertFalse((self.tmp / "named" / "resume-structure.md").exists())
 
     def test_unknown_style_is_an_input_error(self) -> None:
         self._resume_file()
@@ -433,7 +432,7 @@ class TestResumeCli(TempCase):
                 raise AssertionError("简历排版不应该创建大模型客户端")
 
         with self._patch_dirs(), mock.patch("jd_agent.tools.resume.read_text", wraps=tools.resume.read_text):
-            with mock.patch("jd_agent.agent.OpenAICompatClient", Bomb):
+            with mock.patch("jd_agent.agents.agent.OpenAICompatClient", Bomb):
                 code = cli.main(["--build-resume", "--llm", "--out", str(self.tmp / "offline"), "--quiet"])
         self.assertEqual(code, cli.EXIT_OK)
         self.assertTrue((self.tmp / "offline" / "resume.html").is_file())
@@ -449,7 +448,9 @@ class TestToolRegistry(unittest.TestCase):
         self.assertEqual(tools.RESUME_TOOL.slug, "resume")
         self.assertTrue(tools.RESUME_TOOL.title)
         self.assertTrue(tools.RESUME_TOOL.usage.startswith("python main.py"))
-        self.assertEqual(tools.TOOLS, (tools.RESUME_TOOL,))
+        self.assertEqual(tools.TOOLS[0], tools.RESUME_TOOL)      # 简历排版仍是第一个注册的工具
+        slugs = [tool.slug for tool in tools.TOOLS]
+        self.assertEqual(len(slugs), len(set(slugs)), "工具 slug 不能重复")
         self.assertIsNone(tools.get_tool("没有这个工具"))
 
     def test_help_lines_are_ready_for_the_cli(self) -> None:
@@ -478,7 +479,7 @@ class TestResumeStyles(TempCase):
     def test_three_styles_render_and_differ(self) -> None:
         resume_file = self._write(self.resume_dir / "r.md", RESUME)
         styles = tools.resume_styles.all_styles()
-        self.assertEqual([style.key for style in styles], ["classic", "compact", "accent"])
+        self.assertEqual([style.key for style in styles], ["classic", "structure", "accent"])
         blocks = set()
         for style in styles:
             resume = tools.build_resume(resume_file, style=style.key)
@@ -495,9 +496,9 @@ class TestResumeStyles(TempCase):
     def test_markdown_only_changes_where_the_style_says_so(self) -> None:
         resume_file = self._write(self.resume_dir / "r.md", RESUME)
         classic = tools.render_markdown(tools.build_resume(resume_file))
-        compact = tools.render_markdown(tools.build_resume(resume_file, style="compact"))
+        structure = tools.render_markdown(tools.build_resume(resume_file, style="structure"))
         accent = tools.render_markdown(tools.build_resume(resume_file, style="accent"))
-        self.assertEqual(classic, compact)                            # 紧凑一页只换 CSS
+        self.assertEqual(classic, structure)                          # 架构清晰只换 CSS
         self.assertNotIn("\n---\n", classic)
         self.assertIn("\n---\n", accent)                              # 强调竖线：章节之间加分隔线
         self.assertIn("### 智能旅行助手 Agent ｜ 全栈开发", classic)
@@ -505,7 +506,7 @@ class TestResumeStyles(TempCase):
 
     def test_default_stem_follows_the_style(self) -> None:
         self.assertEqual(tools.default_stem("classic"), "resume")
-        self.assertEqual(tools.default_stem("compact"), "resume-compact")
+        self.assertEqual(tools.default_stem("structure"), "resume-structure")
         self.assertEqual(tools.default_stem("accent"), "resume-accent")
 
     def test_unknown_style_is_an_error_not_an_exception(self) -> None:
@@ -521,14 +522,14 @@ class TestResumeToolRun(TempCase):
     def test_run_writes_files_and_reports_a_summary(self) -> None:
         resume_file = self._write(self.resume_dir / "r.md", RESUME)
         result = tools.RESUME_TOOL.run(
-            resume_file=resume_file, out_dir=self.tmp / "docs", formats=("html",), style="compact"
+            resume_file=resume_file, out_dir=self.tmp / "docs", formats=("html",), style="structure"
         )
         self.assertTrue(result.ok, result.error)
-        self.assertEqual([item.name for item in result.written], ["resume-compact.html"])
+        self.assertEqual([item.name for item in result.written], ["resume-structure.html"])
         self.assertTrue(result.written[0].is_file())
         labels = dict(result.summary)
         self.assertEqual(labels["姓名"], "周每每")
-        self.assertIn("紧凑一页", labels["排版风格"])
+        self.assertIn("架构清晰", labels["排版风格"])
         # 风格只写在摘要里；notes 说的是「这篇简历被怎么规整过」
         self.assertFalse(any("排版风格" in note for note in result.notes))
         self.assertEqual(result.as_dict()["files"], result.files)

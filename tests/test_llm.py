@@ -23,8 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from jd_agent import cli  # noqa: E402
-from jd_agent.agent import run_agent  # noqa: E402
-from jd_agent.generate import (  # noqa: E402
+from jd_agent.agents.agent import run_agent  # noqa: E402
+from jd_agent.agents.generate import (  # noqa: E402
     CallBudget,
     build_report_payload,
     parse_draft,
@@ -32,9 +32,9 @@ from jd_agent.generate import (  # noqa: E402
     parse_polish,
     verdict_word,
 )
-from jd_agent.render import render_html, render_markdown  # noqa: E402
-from jd_agent.settings import LLMSettings, load_env, resolve_settings  # noqa: E402
-from jd_agent.llm import (  # noqa: E402
+from jd_agent.agents.render import render_html, render_markdown  # noqa: E402
+from jd_agent.core.settings import LLMSettings, load_env, resolve_settings  # noqa: E402
+from jd_agent.core.llm import (  # noqa: E402
     DEFAULT_CALL_LIMIT,
     DEFAULT_CALL_TIMEOUT,
     DEFAULT_RETRIES,
@@ -43,8 +43,8 @@ from jd_agent.llm import (  # noqa: E402
     check_llm,
     parse_json_reply,
 )
-from jd_agent.project import parse_project_text  # noqa: E402
-from jd_agent.schema import (  # noqa: E402
+from jd_agent.domain.project import parse_project_text  # noqa: E402
+from jd_agent.core.schema import (  # noqa: E402
     DECISIONS,
     EVIDENCE_ACTION,
     EVIDENCE_MENTION,
@@ -63,7 +63,7 @@ from jd_agent.schema import (  # noqa: E402
     STATUS_SKIPPED,
     LlmBlock,
 )
-from jd_agent.vision import (  # noqa: E402
+from jd_agent.services.vision import (  # noqa: E402
     build_vision_messages,
     collect_images,
     enrich_project,
@@ -319,7 +319,7 @@ class TempCase(unittest.TestCase):
 
 class TestDefaultOff(TempCase):
     def test_default_run_never_builds_a_client(self) -> None:
-        with mock.patch("jd_agent.agent.OpenAICompatClient", BombClient):
+        with mock.patch("jd_agent.agents.agent.OpenAICompatClient", BombClient):
             state = run_agent(self.jd_path, self.project_path)
         self.assertEqual(
             [step.action for step in state.trace],
@@ -332,7 +332,7 @@ class TestDefaultOff(TempCase):
 
     def test_default_off_matches_rule_only_run(self) -> None:
         base = self.baseline()
-        with mock.patch("jd_agent.agent.OpenAICompatClient", BombClient):
+        with mock.patch("jd_agent.agents.agent.OpenAICompatClient", BombClient):
             state = run_agent(self.jd_path, self.project_path)
         self.assertEqual([step.action for step in state.trace], [step.action for step in base.trace])
         self.assertEqual([step.observation for step in state.trace], [step.observation for step in base.trace])
@@ -461,7 +461,7 @@ class TestVisionStep(TempCase):
         self.assertEqual(len(state.project.facts), len(base.project.facts))
 
     def test_vision_without_key_stays_offline(self) -> None:
-        with mock.patch("jd_agent.agent.OpenAICompatClient", BombClient):
+        with mock.patch("jd_agent.agents.agent.OpenAICompatClient", BombClient):
             state = run_agent(self.jd_path, self.project_path, vision=True, settings=LLMSettings())
         step = [item for item in state.trace if item.action == "EnrichWithVision"][0]
         self.assertEqual(step.decision, "Continue")
@@ -676,7 +676,7 @@ class TestLlmDegradation(TempCase):
         self.assertTrue(state.verdict.stop_reason)
 
     def test_llm_without_key_notes_and_stays_offline(self) -> None:
-        with mock.patch("jd_agent.agent.OpenAICompatClient", BombClient):
+        with mock.patch("jd_agent.agents.agent.OpenAICompatClient", BombClient):
             state = run_agent(self.jd_path, self.project_path, llm=True, settings=LLMSettings())
         report = state.llm_report
         self.assertEqual([block.status for block in report.blocks], [STATUS_OFF] * 3)
@@ -710,7 +710,7 @@ class TestLlmDegradation(TempCase):
         self.assertEqual(state.trace[-1].action, "CheckSufficiency")
 
     def test_generation_layer_crash_is_contained(self) -> None:
-        with mock.patch("jd_agent.agent.generate_llm_report", side_effect=RuntimeError("boom")):
+        with mock.patch("jd_agent.agents.agent.generate_llm_report", side_effect=RuntimeError("boom")):
             state = self.run_with_llm()
         report = state.llm_report
         self.assertEqual([block.status for block in report.blocks], [STATUS_FAILED] * 3)
@@ -731,7 +731,7 @@ class TestCallDiscipline(TempCase):
                 created.append(args)
                 super().__init__(*args, **kwargs)
 
-        with mock.patch("jd_agent.agent.OpenAICompatClient", Recorder):
+        with mock.patch("jd_agent.agents.agent.OpenAICompatClient", Recorder):
             run_agent(self.jd_path, self.project_path, llm=True, settings=self._settings())
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0][3], DEFAULT_CALL_TIMEOUT)

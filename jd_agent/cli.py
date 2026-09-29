@@ -6,11 +6,36 @@
     python main.py --project input/profile/我的简历.md     # 第二个输入可以是任何 md，包括简历
     python main.py --answer "这个项目的结果是……"      # 回答 Agent 提出的那一个问题
 
-简历排版工具（纯规则、不联网、不调用大模型；三套风格 classic / compact / accent）：
+简历排版工具（纯规则、不联网、不调用大模型；三套风格 classic / structure / accent）：
     python main.py --build-resume                    # 把 input/profile 下的简历排成 output/resume.md + .html
-    python main.py --build-resume --resume-style compact     # 换风格 → output/resume-compact.md + .html
+    python main.py --build-resume --resume-style structure   # 换风格 → output/resume-structure.md + .html
     python main.py --build-resume --resume-file input/profile/个人简历1.md
     python main.py --build-resume --resume-project input/project/示例项目1-AI周报助手.md
+
+JD Agent（LangGraph）：把 JD（文本 / 图片 / 网址）转成统一模板的 Markdown：
+    python main.py --jd-agent --jd-text "岗位职责：……"       # 文本直接读取（不联网）
+    python main.py --jd-agent --jd-file input/jd/xx.md        # 文件走文件解析 Tool（纯规则）
+    python main.py --jd-agent --jd-image assets/jd.png        # 图片走 Qwen-VL（需 .env）
+    python main.py --jd-agent --jd-url "https://.../job/1"    # 网址抓一次 HTML → Markdown
+    python main.py --jd-agent --jd-url "https://..." --jd-trace   # 额外写出完整 Trace
+
+Resume Agent（LangGraph）：把简历拆成事实条目，逐条判证据等级：
+    python main.py --resume-agent --cv-file input/profile/xx.md   # 文件：走文件解析 Tool（纯规则）
+    python main.py --resume-agent --cv-text "教育背景：……"         # 文本：直接读取（不联网）
+    python main.py --resume-agent --cv-image assets/cv.png         # 图片：Qwen-VL 逐字转录（需 .env）
+    python main.py --resume-agent --cv-file input/profile/xx.md --cv-trace   # 额外写出完整 Trace
+
+    判定顺序是「先挡伪装，再判等级」：否定（「没做过 Docker 部署」）与背景（「旨在…」「计划学习…」）
+    先被挡掉，剩下的条目才判 有结果 / 有动作 / 仅提及。输入的四个开关用 --cv-*，避开排版模式的 --resume-file。
+
+Polish Agent（LangGraph）：基于「已核验事实 + JD 要求」给建议写法 / 追问预演 / 润色（JD 与简历各给一路）：
+    python main.py --polish-agent --jd-file input/jd/xx.md --cv-file input/profile/xx.md
+    python main.py --polish-agent --jd-text "岗位职责：……" --cv-file input/profile/xx.md
+    python main.py --polish-agent --jd-file input/jd/xx.md --cv-file input/profile/xx.md --polish-trace
+
+    规则先跑、模型后介入：工具先把「要求 ↔ 事实」钉死（结构化 / 否定背景 / 证据等级 / 能力词典匹配），
+    模型只读这份简报写三块内容。没有文本层 key 时三块标「未启用」（简报照出，退出码仍为 0）；
+    少给一路来源直接退出码 2，撑不起一份建议时退出码 3。
 
 可选的大模型能力（默认关闭，不联网；先配好项目根 .env）：
     python main.py --llm                            # 报告生成后：写法草稿 + 报告润色（两块都带 source）
@@ -30,13 +55,25 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from . import __version__
-from .agent import MAX_ROUNDS, build_text_budget, run_agent
-from .jd import load_jd, load_jd_positions
+from .agents.agent import MAX_ROUNDS, build_text_budget, run_agent
+from .domain.jd import load_jd, load_jd_positions
+from .services.jd_source import SOURCE_URL, describe_sources, detect_sources, unusable_notes
 from .tools import RESUME_FORMATS, RESUME_TOOL, resume_styles, tool_help_lines
-from .schema import JobPosting
-from .settings import DEFAULT_ENV_FILE, EnvLoadResult, LLMSettings, load_env, resolve_settings
-from .llm import DEFAULT_CALL_LIMIT, OpenAICompatClient, check_llm
-from .render import render_console, render_html, render_json, render_markdown
+from .core.schema import JobPosting
+from .core.settings import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_ENV_FILE,
+    EnvLoadResult,
+    LLMSettings,
+    StorageSettings,
+    load_env,
+    resolve_settings,
+    resolve_storage_settings,
+)
+from .knowledge import KNOWLEDGE_TIERS, L1_STATIC, L2_SEMI_STATIC, L3_DYNAMIC, KnowledgeBase, build_knowledge_base
+from .memory import MemoryManager, build_memory_manager
+from .core.llm import DEFAULT_CALL_LIMIT, OpenAICompatClient, build_client, check_llm
+from .agents.render import render_console, render_html, render_json, render_markdown
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INPUT_DIR = PROJECT_ROOT / "input"
@@ -62,14 +99,115 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "  python main.py --jd input/jd/xx.md --jd-title 岗位二\n"
             "  python main.py --answer \"周报助手的结果是召回率 0.82\"\n"
             "  python main.py --project input/profile/资料不足项目测试简历1.md\n"
+            "  python main.py --enable-memory --session-id demo\n"
+            "  python main.py --index-only                         # 只增量建知识索引，然后退出\n"
+            "  python main.py --enable-knowledge --knowledge-tiers L1,L2\n"
             "  python main.py --build-resume        # 简历排版：output/resume.md + output/resume.html\n"
-            "  python main.py --build-resume --resume-style compact   # 换风格 → resume-compact.*\n"
+            "  python main.py --build-resume --resume-style structure # 换风格 → resume-structure.*\n"
+            "  python main.py --jd-agent --jd-url \"https://…\"   # JD Agent：JD（文本/图片/网址）-> Markdown\n"
+            "  python main.py --resume-agent --cv-file input/profile/xx.md   # Resume Agent：简历 -> 事实条目 + 证据等级\n"
+            "  python main.py --polish-agent --jd-file input/jd/xx.md --cv-file input/profile/xx.md\n"
+            "   # Polish Agent：JD + 简历 -> 建议写法 / 追问预演 / 润色\n"
             "\n可用工具（jd_agent/tools/）：\n"
             + "".join(f"  {line}\n" for line in tool_help_lines())
         ),
     )
     parser.add_argument("--jd", help="JD 文件（不指定时读 input/jd/ 下所有文件的全部岗位）")
     parser.add_argument("--jd-title", dest="jd_title", help="JD 文件里有多个岗位时，用标题关键字指定（如「岗位二」）")
+    parser.add_argument(
+        "--jd-agent",
+        dest="jd_agent",
+        action="store_true",
+        help="JD Agent（LangGraph）：把 JD（文本 / 图片 / 网址）转成 Markdown，写出 output/jd.md",
+    )
+    parser.add_argument(
+        "--jd-text",
+        dest="jd_text",
+        help="直接给的 JD 文本（多行就用引号包起来；整段是一个网址时自动按网址处理）",
+    )
+    parser.add_argument(
+        "--jd-file",
+        dest="jd_files",
+        action="append",
+        help="本地 JD 文件（md / txt / html / json / yaml，可重复）；走文件解析 Tool，不联网",
+    )
+    parser.add_argument(
+        "--jd-image",
+        dest="jd_images",
+        action="append",
+        help="本地 JD 截图（png / jpg…，可重复）；走 Qwen-VL 逐字转录，需要 .env 里的 key",
+    )
+    parser.add_argument(
+        "--jd-url",
+        dest="jd_urls",
+        action="append",
+        help="JD 网址（可重复）；每个地址发 1 次 HTTP GET，只抓你给的那个页面",
+    )
+    parser.add_argument("--jd-name", dest="jd_name", help="这份 JD 的标题（默认取原文里第一个标题）")
+    parser.add_argument("--jd-out", dest="jd_out", help=f"输出的 Markdown 路径（默认 {OUTPUT_DIR / 'jd.md'}）")
+    parser.add_argument(
+        "--jd-trace",
+        dest="jd_trace",
+        action="store_true",
+        help="额外写出带完整 Trace 的 Markdown（与输出同名，后缀 .trace.md）",
+    )
+    parser.add_argument(
+        "--resume-agent",
+        dest="resume_agent",
+        action="store_true",
+        help="Resume Agent（LangGraph）：把简历拆成事实条目并判证据等级，写出 output/resume_facts.md",
+    )
+    parser.add_argument(
+        "--cv-text",
+        dest="cv_text",
+        help="直接给的简历文本（多行就用引号包起来；整段是一个网址时自动按网址处理）",
+    )
+    parser.add_argument(
+        "--cv-file",
+        dest="cv_files",
+        action="append",
+        help="本地简历文件（md / txt / html / json / yaml，可重复）；走文件解析 Tool，不联网",
+    )
+    parser.add_argument(
+        "--cv-image",
+        dest="cv_images",
+        action="append",
+        help="本地简历截图（png / jpg…，可重复）；走 Qwen-VL 逐字转录，需要 .env 里的 key",
+    )
+    parser.add_argument(
+        "--cv-url",
+        dest="cv_urls",
+        action="append",
+        help="在线简历网址（可重复）；每个地址发 1 次 HTTP GET，只抓你给的那个页面",
+    )
+    parser.add_argument("--cv-title", dest="cv_title", help="这份简历的标题（默认取原文里第一个标题）")
+    parser.add_argument(
+        "--cv-out", dest="cv_out", help=f"输出的 Markdown 路径（默认 {OUTPUT_DIR / 'resume_facts.md'}）"
+    )
+    parser.add_argument(
+        "--cv-trace",
+        dest="cv_trace",
+        action="store_true",
+        help="额外写出带完整 Trace 的 Markdown（与输出同名，后缀 .trace.md）",
+    )
+    parser.add_argument(
+        "--polish-agent",
+        dest="polish_agent",
+        action="store_true",
+        help=(
+            "Polish Agent（LangGraph）：JD + 简历 -> 建议写法 / 追问预演 / 润色，"
+            f"写出 {OUTPUT_DIR / 'polish.md'}"
+        ),
+    )
+    parser.add_argument(
+        "--polish-out", dest="polish_out", help=f"输出的 Markdown 路径（默认 {OUTPUT_DIR / 'polish.md'}）"
+    )
+    parser.add_argument(
+        "--polish-trace",
+        dest="polish_trace",
+        action="store_true",
+        help="额外写出带完整 Trace 的 Markdown（与输出同名，后缀 .trace.md）",
+    )
     parser.add_argument(
         "--project",
         help="项目描述文件（默认取 input/project/ 下的第一个 .md；也可以是 input/profile/ 下的简历 md）",
@@ -108,10 +246,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume-name",
         dest="resume_name",
-        help="简历文件名（默认按风格取名：resume / resume-compact / resume-accent）",
+        help="简历文件名（默认按风格取名：resume / resume-structure / resume-accent）",
     )
     parser.add_argument("--answer", help="回答 Agent 提出的问题；回答会作为新材料并入证据池后重新检索")
     parser.add_argument("--max-rounds", dest="max_rounds", type=int, default=MAX_ROUNDS, help=f"最多检索轮数（默认 {MAX_ROUNDS}）")
+    parser.add_argument("--session-id", dest="session_id", default="default", help="记忆会话 ID（默认 default）")
+    parser.add_argument(
+        "--enable-memory",
+        dest="enable_memory",
+        action="store_true",
+        help="启用 L0/L1/L2 记忆；L1 默认内存实现，L2 默认写入项目 data/ 下的 JSONL",
+    )
+    parser.add_argument(
+        "--enable-knowledge",
+        dest="enable_knowledge",
+        action="store_true",
+        help="启用 L1/L2/L3 知识库检索；未索引时先跑 --index-knowledge",
+    )
+    parser.add_argument(
+        "--index-knowledge",
+        dest="index_knowledge",
+        action="store_true",
+        help="把 knowledge/、input/、output/ 按 L1/L2/L3 层级增量写入知识索引",
+    )
+    parser.add_argument(
+        "--index-only",
+        dest="index_only",
+        action="store_true",
+        help="只建立 / 更新知识索引，不读取 JD，也不生成分析报告",
+    )
+    parser.add_argument(
+        "--knowledge-tiers",
+        dest="knowledge_tiers",
+        default="L1,L2,L3",
+        help="检索哪些知识层级，逗号分隔（L1 静态 / L2 半静态 / L3 动态；默认全部）",
+    )
+    parser.add_argument(
+        "--data-dir",
+        dest="data_dir",
+        default="",
+        help=f"运行时数据目录（默认 {DEFAULT_DATA_DIR}，始终建议放在 D 盘项目内）",
+    )
     parser.add_argument("--out", help=f"输出目录（默认 {OUTPUT_DIR}）")
     parser.add_argument("--formats", default=",".join(FORMATS), help="输出格式，逗号分隔：md,json,html")
     parser.add_argument(
@@ -277,6 +452,75 @@ def _prepare_settings(args) -> Tuple[Optional[LLMSettings], EnvLoadResult, str]:
     return settings, loaded, ""
 
 
+def _prepare_storage_settings(args) -> Tuple[StorageSettings, EnvLoadResult, str]:
+    env_path = Path(args.env).expanduser() if args.env else DEFAULT_ENV_FILE
+    if args.env and not env_path.is_file():
+        return StorageSettings(), EnvLoadResult(path=str(env_path)), f"找不到 .env 文件：{env_path}"
+    loaded = load_env(env_path)
+    if loaded.error:
+        return StorageSettings(), loaded, loaded.error
+    settings = resolve_storage_settings(data_dir=args.data_dir or "")
+    return settings, loaded, ""
+
+
+def _parse_knowledge_tiers(raw: str) -> Tuple[str, ...]:
+    aliases = {
+        "l1": L1_STATIC,
+        "static": L1_STATIC,
+        "静态": L1_STATIC,
+        "l2": L2_SEMI_STATIC,
+        "semi-static": L2_SEMI_STATIC,
+        "半静态": L2_SEMI_STATIC,
+        "l3": L3_DYNAMIC,
+        "dynamic": L3_DYNAMIC,
+        "动态": L3_DYNAMIC,
+    }
+    values = [item.strip().casefold() for item in str(raw or "").split(",") if item.strip()]
+    if not values or "all" in values or "全部" in values:
+        return KNOWLEDGE_TIERS
+    tiers: List[str] = []
+    for value in values:
+        tier = aliases.get(value)
+        if tier is None:
+            raise ValueError(f"未知知识层级：{value}（可选 L1 / L2 / L3）")
+        if tier not in tiers:
+            tiers.append(tier)
+    return tuple(tiers)
+
+
+def _build_context_stores(
+    settings: StorageSettings,
+    *,
+    memory_enabled: bool,
+    knowledge_enabled: bool,
+) -> Tuple[Optional[MemoryManager], Optional[KnowledgeBase]]:
+    memory = None
+    knowledge = None
+    if memory_enabled:
+        memory = build_memory_manager(
+            settings.data_dir,
+            short_term_ttl_seconds=settings.l1_ttl_seconds,
+            short_term_max_items=settings.l1_max_items,
+            long_term_backend=settings.long_term_backend,
+            mongodb_uri=settings.mongodb_uri,
+            mongodb_database=settings.mongodb_database,
+        )
+    if knowledge_enabled:
+        knowledge = build_knowledge_base(
+            settings.data_dir,
+            embedding_backend=settings.embedding_backend,
+            embedding_api_key=settings.embedding_api_key,
+            embedding_base_url=settings.embedding_base_url,
+            embedding_model=settings.embedding_model,
+            embedding_dimensions=settings.embedding_dimensions,
+            index_backend=settings.index_backend,
+            qdrant_url=settings.qdrant_url,
+            qdrant_api_key=settings.qdrant_api_key,
+            qdrant_collection=settings.qdrant_collection,
+        )
+    return memory, knowledge
+
+
 def run_build_resume(args) -> int:
     """简历排版模式：读简历 md，输出排好版的 md / html（纯规则，不联网、不调大模型）。
 
@@ -321,6 +565,276 @@ def run_build_resume(args) -> int:
     return EXIT_OK
 
 
+def run_jd_agent_mode(args, vision_client: Optional[OpenAICompatClient] = None) -> int:
+    """JD Agent 模式：把 JD（文本 / 图片 / 网址）转成 Markdown（LangGraph 编排）。
+
+    真正的活交给 jd_agent.agents.jd_graph；这里只做三件事：挑来源、按需读 .env、打印 Trace 与结果。
+    只有图片分支需要 key（Qwen-VL），文本 / 文件 / 网址三种来源都不读 .env。
+    """
+    try:                       # 只有这个模式需要 langgraph：没装也不影响其它模式
+        from .agents.jd_graph import JDRequest, render_jd_console, render_jd_trace, run_jd_agent
+    except ImportError:
+        _say("[错误] --jd-agent 需要 langgraph：pip install langgraph（其它模式不受影响）")
+        return EXIT_ERROR
+
+    request = JDRequest(
+        text=args.jd_text or "",
+        files=tuple(args.jd_files or ()),
+        images=tuple(args.jd_images or ()),
+        urls=tuple(args.jd_urls or ()),
+        title=args.jd_name or "",
+    )
+    if request.empty:
+        _say("[错误] --jd-agent 至少要给一个 JD 来源：--jd-text / --jd-file / --jd-image / --jd-url")
+        return EXIT_ERROR
+
+    settings: Optional[LLMSettings] = None
+    client = vision_client
+    if request.images:
+        settings, loaded, error = _prepare_settings(args)
+        if error:
+            _say(f"[错误] {error}")
+            return EXIT_ERROR
+        if client is None:
+            client = build_client(settings, "vision")
+        if not args.quiet:
+            _say(f"[配置] .env：{loaded.summary()}")
+            for line in settings.describe():
+                _say(f"[配置] {line}")
+            _say("")
+
+    sources = detect_sources(
+        text=request.text,
+        files=request.files,
+        images=request.images,
+        urls=request.urls,
+        vision_ready=client is not None,
+    )
+    usable = [source for source in sources if source.usable]
+    if not usable:
+        _say("[错误] 没有一个能读的 JD 来源：")
+        for note in unusable_notes(sources):
+            _say(f"  - {note}")
+        return EXIT_ERROR
+
+    out_path = Path(args.jd_out).expanduser() if args.jd_out else OUTPUT_DIR / "jd.md"
+    if not args.quiet:
+        _say(f"[输入] {len(usable)} 个可用来源：{describe_sources(usable)}")
+        if any(source.kind == SOURCE_URL for source in usable):
+            _say("[输入] 网址抓取：每个地址发 1 次 HTTP GET，只抓你给的那个页面")
+        _say("")
+
+    state = run_jd_agent(
+        request,
+        settings=settings,
+        vision_client=client,
+        sources=sources,
+        out_dir=out_path.parent,
+        stem=out_path.stem,
+    )
+    if not args.quiet:
+        for line in render_jd_console(state):
+            _say(line)
+    if args.jd_trace:
+        trace_path = out_path.with_suffix(".trace.md")
+        trace_path.write_text(render_jd_trace(state), encoding="utf-8")
+        if not args.quiet:
+            _say(f"Trace 已写出：{trace_path}")
+            _say("")
+    return EXIT_ASK if state.needs_answer else EXIT_OK
+
+
+def run_resume_agent_mode(args, vision_client: Optional[OpenAICompatClient] = None) -> int:
+    """Resume Agent 模式：把简历拆成事实条目并判证据等级（LangGraph 编排）。
+
+    真正的活交给 jd_agent.agents.resume_graph；这里只做三件事：挑来源、按需读 .env、打印 Trace 与结果。
+    只有图片分支需要 key（Qwen-VL），文本 / 文件 / 网址三种来源都不读 .env。
+    输入的四个开关用 --cv-* 前缀（CV = 简历），避开排版模式已经在用的 --resume-file。
+    """
+    try:                       # 只有这个模式需要 langgraph：没装也不影响其它模式
+        from .agents.resume_graph import (
+            ResumeRequest,
+            render_resume_console,
+            render_resume_trace,
+            run_resume_agent,
+        )
+    except ImportError:
+        _say("[错误] --resume-agent 需要 langgraph：pip install langgraph（其它模式不受影响）")
+        return EXIT_ERROR
+
+    request = ResumeRequest(
+        text=args.cv_text or "",
+        files=tuple(args.cv_files or ()),
+        images=tuple(args.cv_images or ()),
+        urls=tuple(args.cv_urls or ()),
+        title=args.cv_title or "",
+    )
+    if request.empty:
+        _say("[错误] --resume-agent 至少要给一个简历来源：--cv-text / --cv-file / --cv-image / --cv-url")
+        return EXIT_ERROR
+
+    settings: Optional[LLMSettings] = None
+    client = vision_client
+    if request.images:
+        settings, loaded, error = _prepare_settings(args)
+        if error:
+            _say(f"[错误] {error}")
+            return EXIT_ERROR
+        if client is None:
+            client = build_client(settings, "vision")
+        if not args.quiet:
+            _say(f"[配置] .env：{loaded.summary()}")
+            for line in settings.describe():
+                _say(f"[配置] {line}")
+            _say("")
+
+    sources = detect_sources(
+        text=request.text,
+        files=request.files,
+        images=request.images,
+        urls=request.urls,
+        vision_ready=client is not None,
+    )
+    usable = [source for source in sources if source.usable]
+    if not usable:
+        _say("[错误] 没有一个能读的简历来源：")
+        for note in unusable_notes(sources):
+            _say(f"  - {note}")
+        return EXIT_ERROR
+
+    out_path = Path(args.cv_out).expanduser() if args.cv_out else OUTPUT_DIR / "resume_facts.md"
+    if not args.quiet:
+        _say(f"[输入] {len(usable)} 个可用来源：{describe_sources(usable)}")
+        _say("[输入] 判定顺序：先挡「写了但没做过」（否定 / 背景），再判证据等级")
+        _say("")
+
+    state = run_resume_agent(
+        request,
+        settings=settings,
+        vision_client=client,
+        sources=sources,
+        out_dir=out_path.parent,
+        stem=out_path.stem,
+    )
+    if not args.quiet:
+        for line in render_resume_console(state):
+            _say(line)
+    if args.cv_trace:
+        trace_path = out_path.with_suffix(".trace.md")
+        trace_path.write_text(render_resume_trace(state), encoding="utf-8")
+        if not args.quiet:
+            _say(f"Trace 已写出：{trace_path}")
+            _say("")
+    return EXIT_ASK if state.needs_answer else EXIT_OK
+
+
+def run_polish_agent_mode(
+    args,
+    text_client: Optional[OpenAICompatClient] = None,
+    vision_client: Optional[OpenAICompatClient] = None,
+) -> int:
+    """Polish Agent 模式：基于「已核验事实 + JD 要求」给出建议写法 / 追问预演 / 润色（LangGraph 编排）。
+
+    真正的活交给 jd_agent.agents.polish_graph；这里只做三件事：挑两路来源、读 .env、打印 Trace 与结果。
+    与 JD / Resume Agent 的一处区别：这两路必须同时给（一份 JD + 一份简历），所以一律读 .env ——
+    三块内容要文本层 key；给了图片还要多模态 key。没有文本层 key 时三块统一标「未启用」，简报照出。
+    """
+    try:                       # 只有这个模式需要 langgraph：没装也不影响其它模式
+        from .agents.polish_graph import (
+            PolishRequest,
+            render_polish_console,
+            render_polish_trace,
+            run_polish_agent,
+        )
+    except ImportError:
+        _say("[错误] --polish-agent 需要 langgraph：pip install langgraph（其它模式不受影响）")
+        return EXIT_ERROR
+
+    request = PolishRequest(
+        jd_text=args.jd_text or "",
+        jd_files=tuple(args.jd_files or ()),
+        jd_images=tuple(args.jd_images or ()),
+        jd_urls=tuple(args.jd_urls or ()),
+        jd_title=args.jd_name or "",
+        cv_text=args.cv_text or "",
+        cv_files=tuple(args.cv_files or ()),
+        cv_images=tuple(args.cv_images or ()),
+        cv_urls=tuple(args.cv_urls or ()),
+        cv_title=args.cv_title or "",
+    )
+    missing = request.missing_sides
+    if missing:                # 只有一路就没有对照：光有 JD 只能得到要求清单，光有简历只能得到事实清单
+        _say(f"[错误] --polish-agent 要同时给 JD 与简历，现在缺：{'、'.join(missing)}")
+        _say("       JD 用 --jd-text / --jd-file / --jd-image / --jd-url；简历用 --cv-* 那一组")
+        return EXIT_ERROR
+
+    settings, loaded, error = _prepare_settings(args)   # 三块内容要用文本层 key，所以这一模式一律读 .env
+    if error:
+        _say(f"[错误] {error}")
+        return EXIT_ERROR
+    client = vision_client
+    if (request.jd_images or request.cv_images) and client is None:
+        client = build_client(settings, "vision")
+    if not args.quiet:
+        _say(f"[配置] .env：{loaded.summary()}")
+        for line in settings.describe():
+            _say(f"[配置] {line}")
+        _say("")
+
+    vision_ready = client is not None or bool(getattr(settings, "vision_ready", False))
+    jd_sources = detect_sources(
+        text=request.jd_text,
+        files=request.jd_files,
+        images=request.jd_images,
+        urls=request.jd_urls,
+        vision_ready=vision_ready,
+    )
+    cv_sources = detect_sources(
+        text=request.cv_text,
+        files=request.cv_files,
+        images=request.cv_images,
+        urls=request.cv_urls,
+        vision_ready=vision_ready,
+    )
+    usable_jd = [source for source in jd_sources if source.usable]
+    usable_cv = [source for source in cv_sources if source.usable]
+    if not usable_jd or not usable_cv:      # 有一路一条都读不出来：这不是「问一句」能解决的，当输入错误
+        _say("[错误] 至少有一路没有能读的来源：")
+        skipped = [s for s in jd_sources + cv_sources if not s.usable]
+        for note in unusable_notes(skipped):
+            _say(f"  - {note}")
+        return EXIT_ERROR
+
+    out_path = Path(args.polish_out).expanduser() if args.polish_out else OUTPUT_DIR / "polish.md"
+    if not args.quiet:
+        _say(f"[输入] JD 侧 {len(usable_jd)} 个可用来源：{describe_sources(usable_jd)}")
+        _say(f"[输入] 简历侧 {len(usable_cv)} 个可用来源：{describe_sources(usable_cv)}")
+        _say("[输入] 顺序：先挡「写了没做过」（否定 / 背景），再判证据等级，最后才让模型写")
+        _say("")
+
+    state = run_polish_agent(
+        request,
+        settings=settings,
+        text_client=text_client,
+        vision_client=client,
+        jd_sources=jd_sources,
+        cv_sources=cv_sources,
+        out_dir=out_path.parent,
+        stem=out_path.stem,
+        llm_max_calls=max(1, args.llm_max_calls),
+    )
+    if not args.quiet:
+        for line in render_polish_console(state):
+            _say(line)
+    if args.polish_trace:
+        trace_path = out_path.with_suffix(".trace.md")
+        trace_path.write_text(render_polish_trace(state), encoding="utf-8")
+        if not args.quiet:
+            _say(f"Trace 已写出：{trace_path}")
+            _say("")
+    return EXIT_ASK if state.needs_answer else EXIT_OK
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     text_client: Optional[OpenAICompatClient] = None,
@@ -333,10 +847,21 @@ def main(
     args = build_arg_parser().parse_args(argv)
     use_llm = bool(args.llm)
     use_vision = bool(args.vision)
+    use_memory = bool(args.enable_memory)
+    use_knowledge = bool(args.enable_knowledge or args.index_knowledge or args.index_only)
     settings: Optional[LLMSettings] = None
 
     if args.build_resume:
         return run_build_resume(args)
+
+    if args.jd_agent:
+        return run_jd_agent_mode(args, vision_client=vision_client)
+
+    if args.resume_agent:
+        return run_resume_agent_mode(args, vision_client=vision_client)
+
+    if args.polish_agent:
+        return run_polish_agent_mode(args, text_client=text_client, vision_client=vision_client)
 
     if use_llm or use_vision or args.check_llm:
         settings, loaded, error = _prepare_settings(args)
@@ -363,6 +888,46 @@ def main(
             return EXIT_ERROR
         _say("自检通过：key、网络与模型名都可用。")
         return EXIT_OK
+
+    memory_manager: Optional[MemoryManager] = None
+    knowledge_base: Optional[KnowledgeBase] = None
+    knowledge_tiers: Tuple[str, ...] = ()
+    if use_memory or use_knowledge:
+        try:
+            storage_settings, storage_loaded, storage_error = _prepare_storage_settings(args)
+            if storage_error:
+                _say(f"[错误] {storage_error}")
+                return EXIT_ERROR
+            knowledge_tiers = _parse_knowledge_tiers(args.knowledge_tiers)
+            memory_manager, knowledge_base = _build_context_stores(
+                storage_settings,
+                memory_enabled=use_memory,
+                knowledge_enabled=use_knowledge,
+            )
+        except (ImportError, ValueError) as exc:
+            _say(f"[错误] 记忆 / 知识库初始化失败：{exc}")
+            return EXIT_ERROR
+        if not args.quiet:
+            _say(f"[配置] .env：{storage_loaded.summary()}")
+            for line in storage_settings.describe():
+                _say(f"[配置] {line}")
+            if knowledge_base is not None:
+                stats = knowledge_base.stats()
+                for line in stats.lines():
+                    _say(f"[知识库] {line}")
+            _say("")
+        if (args.index_knowledge or args.index_only) and knowledge_base is not None:
+            try:
+                changed = knowledge_base.ensure_default_index(PROJECT_ROOT)
+            except Exception as exc:
+                _say(f"[错误] 知识索引失败：{exc.__class__.__name__}: {exc}")
+                return EXIT_ERROR
+            if not args.quiet:
+                _say(f"[知识库] 增量索引完成：写入 / 更新 {changed} 个切片")
+                _say("")
+
+        if args.index_only:
+            return EXIT_OK
 
     formats = [item.strip().lower() for item in args.formats.split(",") if item.strip()]
     unknown = [item for item in formats if item not in FORMATS]
@@ -414,6 +979,10 @@ def main(
             images=tuple(args.images or ()),
             posting=posting,
             llm_budget=budget,
+            memory=memory_manager,
+            knowledge=knowledge_base,
+            session_id=args.session_id or "default",
+            knowledge_tiers=knowledge_tiers,
         )
         written: List[Path] = []
         for name in formats:
