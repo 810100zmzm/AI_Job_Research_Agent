@@ -36,9 +36,10 @@ from ..tools.resume_styles import DEFAULT_STYLE, all_styles, get_style
 
 MAX_LLM_FACTS = 10
 MAX_FACT_CHARS = 240
-MAX_POLISH_CHARS = 280
-MAX_POLISH_RATIO = 1.8
-MAX_LLM_CALLS = 3
+MAX_POLISH_CHARS = 320
+MAX_POLISH_RATIO = 2.0
+# 单次润色的 LLM 调用上限；实际预算还会按待处理条数自动收窄（见 _auto_budget）。
+MAX_LLM_CALLS = 6
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,13 @@ TERM_MAPPING: Tuple[TermMapping, ...] = (
     TermMapping("提高到", "提高至", "提高至", "保留原数字与顺序"),
     TermMapping("增长到", "增长至", "增长至", "保留原数字与顺序"),
     TermMapping("增加到", "增加至", "增加至", "保留原数字与顺序"),
+    TermMapping("产出", "输出", "体系化产出", "不补产出物类型或规模"),
+    TermMapping("沉淀", "沉淀", "体系化沉淀", "不补方法或规模"),
+    TermMapping("落地", "落地", "工程化落地", "不补上线或交付状态"),
+    TermMapping("对齐", "对齐", "深度对齐", "不补对齐结果"),
+    TermMapping("推动", "推动", "驱动推进", "不扩大职责范围"),
+    TermMapping("支撑", "支撑", "持续支撑", "不补可用性或规模"),
+    TermMapping("调研", "调研", "系统调研", "不补结论"),
 )
 
 TERM_MAPPING_PROMPT = "术语映射表（只在事实、责任和能力等级不变时使用）：\n" + "\n".join(
@@ -120,29 +128,25 @@ TERM_MAPPING_PROMPT = "术语映射表（只在事实、责任和能力等级不
     for item in TERM_MAPPING
 )
 
-# L1 只允许语法清理，不换动词。
+# 三级共用的语法清理：只做不改语义的清理，不换动词、不加词、不前置结果。
+_GRAMMAR_CLEANUP: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^\s*我(?:们)?\s*"), ""),
+    (re.compile(r"能够"), "能"),
+    (re.compile(r"主要是"), ""),
+    (re.compile(r"我们的"), ""),
+    (re.compile(r"以及"), "和"),
+    (re.compile(r"并且"), "并"),
+    (re.compile(r"的工作(?=[，。；、]|$)"), ""),
+    (re.compile(r"(?<=[\u4e00-\u9fff])[ \u3000]+(?=[\u4e00-\u9fff])"), ""),
+    (re.compile(r"\s+([，。；：、])"), r"\1"),
+    (re.compile(r"([，。；：])\1+"), r"\1"),
+)
+
+# L1 只允许语法清理，不换动词；L2/L3 在语法清理之上再做术语映射。
 _RULE_PATTERNS: Dict[str, Tuple[Tuple[re.Pattern[str], str], ...]] = {
-    "L1": (
-        (re.compile(r"^\s*我(?:们)?\s*"), ""),
-        (re.compile(r"能够"), "能"),
-        (re.compile(r"主要是"), ""),
-        (re.compile(r"\s+([，。；：、])"), r"\1"),
-        (re.compile(r"([，。；：])\1+"), r"\1"),
-    ),
-    "L2": (
-        (re.compile(r"^\s*我(?:们)?\s*"), ""),
-        (re.compile(r"能够"), "能"),
-        (re.compile(r"主要是"), ""),
-        (re.compile(r"\s+([，。；：、])"), r"\1"),
-        (re.compile(r"([，。；：])\1+"), r"\1"),
-    ),
-    "L3": (
-        (re.compile(r"^\s*我(?:们)?\s*"), ""),
-        (re.compile(r"能够"), "能"),
-        (re.compile(r"主要是"), ""),
-        (re.compile(r"\s+([，。；：、])"), r"\1"),
-        (re.compile(r"([，。；：])\1+"), r"\1"),
-    ),
+    "L1": _GRAMMAR_CLEANUP,
+    "L2": _GRAMMAR_CLEANUP,
+    "L3": _GRAMMAR_CLEANUP,
 }
 
 POLISH_SYSTEM_PROMPT = (
@@ -155,6 +159,7 @@ POLISH_SYSTEM_PROMPT = (
     "4) 只输出严格 JSON：{\"items\":[{\"ref\":\"...\",\"original\":\"...\",\"polished\":\"...\"}]}，"
     "每条 ref 和 original 必须与输入完全一致，不能漏项、合并或新增；\n"
     "5) 不输出评价、建议、结论或解释。"
+    "\n6) 每条都要给出改写后的句子；只有该条确实无可改之处，才允许与原文完全相同。"
 )
 
 POLISH_LEVEL_PROMPTS: Dict[str, str] = {
@@ -166,14 +171,16 @@ POLISH_LEVEL_PROMPTS: Dict[str, str] = {
     "L2": (
         POLISH_SYSTEM_PROMPT
         + "\n等级 L2（专业）：允许术语化、动词升级、结构对仗和轻度结果前置，适合正式投递。"
-        "只改表达，不改事实、数字、责任范围、公司 / 学校 / 项目名与证据强度。\n"
+        "只改表达，不改事实、数字、责任范围、公司 / 学校 / 项目名与证据强度。"
+        "原句已经通顺时，也要按术语映射把动词 / 术语换成更专业的表达，不要原样返回。\n"
         + TERM_MAPPING_PROMPT
     ),
     "L3": (
         POLISH_SYSTEM_PROMPT
         + "\n等级 L3（亮眼）：结果前置、行业术语、主动语态、强化词优先。"
         "原文已有数字可以前置；百分比只能由原文已有数字数学推导，不得新增任何其他数字。"
-        "仍不得把参与写成主导、了解写成精通，也不得增加职责或成果。\n"
+        "仍不得把参与写成主导、了解写成精通，也不得增加职责或成果。"
+        "原句已经通顺时，也要按术语映射把动词 / 术语换成更亮眼的表达，不要原样返回。\n"
         + TERM_MAPPING_PROMPT
     ),
 }
@@ -188,6 +195,8 @@ class ResumePolishItem:
     engine: str = "original"
     status: str = "保留原文"
     reason: str = ""
+    candidate: str = ""
+    vetoes: List[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -202,6 +211,10 @@ class ResumePolishStats:
     original: int = 0
     blocked: int = 0
     calls: int = 0
+    noop: int = 0
+    veto: int = 0
+    budget: int = 0
+    failed: int = 0
 
 
 @dataclass
@@ -260,7 +273,7 @@ def polish_resume(
     style: str = DEFAULT_STYLE,
     source_file: str = "resume.md",
     text_client: Optional[Any] = None,
-    max_llm_calls: int = MAX_LLM_CALLS,
+    max_llm_calls: int = 0,  # 0 = 按待处理条数自动给预算（见 _auto_budget）
     enable_polish: bool = True,
 ) -> ResumePolishResult:
     """Polish verified facts and render a styled Markdown / HTML resume.
@@ -304,8 +317,10 @@ def polish_resume(
 
     stats = ResumePolishStats(total=len(eligible), blocked=len(blocked))
     calls = 0
-    if pending and text_client is not None and max_llm_calls > 0:
-        llm_items, calls, error = _llm_items(pending, chosen_level, text_client, max_llm_calls)
+    error = ""
+    budget = max_llm_calls if max_llm_calls > 0 else _auto_budget(len(pending))
+    if pending and text_client is not None and budget > 0:
+        llm_items, calls, error = _llm_items(pending, chosen_level, text_client, budget)
         items.extend(llm_items)
         if error:
             _mark_llm_failure(llm_items, error)
@@ -321,6 +336,10 @@ def polish_resume(
     stats.llm = sum(1 for item in items if item.engine == "llm")
     stats.original = sum(1 for item in items if item.engine == "original")
     stats.calls = calls
+    stats.noop = sum(1 for item in items if item.status == "模型未改动")
+    stats.veto = sum(1 for item in items if item.status == "安全校验未通过")
+    stats.budget = sum(1 for item in items if item.status == "已达调用上限")
+    stats.failed = sum(1 for item in items if item.status == "调用失败")
 
     replacements = {
         clean_text(item.original): item.polished
@@ -335,16 +354,13 @@ def polish_resume(
     markdown = render_markdown(polished_resume)
     html = render_html(polished_resume)
 
-    notice = ""
-    degraded_items = [item for item in items if item.engine == "original"]
-    if degraded_items:
-        notice = "润色未启用：未处理的条目已保留原文，Markdown 和 HTML 仍可正常生成。"
-    elif not eligible:
-        notice = "没有可核验的简历事实，已按原文生成简历。"
-    elif blocked:
-        notice = f"有 {len(blocked)} 条否定或背景内容未进入润色，已在生成简历中按原文保留。"
-    elif not stats.llm and stats.dictionary:
-        notice = "本次全部由规则词典完成润色，没有调用大模型。"
+    notice = _build_notice(
+        stats=stats,
+        eligible=len(eligible),
+        blocked=len(blocked),
+        error=error,
+        client_available=text_client is not None,
+    )
 
     notes = list(doc.notes)
     if replacements:
@@ -359,6 +375,53 @@ def polish_resume(
         stats=stats,
         notes=notes,
     )
+
+
+def _auto_budget(pending_count: int) -> int:
+    """按待处理条数给 LLM 预算：至少 1 次，最多 MAX_LLM_CALLS 次。"""
+    if pending_count <= 0:
+        return 0
+    batches = (pending_count + MAX_LLM_FACTS - 1) // MAX_LLM_FACTS
+    return max(1, min(MAX_LLM_CALLS, batches))
+
+
+def _build_notice(
+    *,
+    stats: "ResumePolishStats",
+    eligible: int,
+    blocked: int,
+    error: str,
+    client_available: bool,
+) -> str:
+    """给用户一句能看懂的话：改了几条、保留几条、为什么没改。"""
+    if not eligible:
+        return "没有可核验的简历事实，已按原文生成简历。"
+    changed = stats.dictionary + stats.llm
+    kept = stats.original
+    if error and kept:
+        head = "润色未启用：LLM 调用失败，未处理的条目已保留原文"
+    elif not client_available and kept:
+        head = "润色未启用：没有可用的文本模型，未处理的条目已保留原文"
+    else:
+        head = "本次润色已完成"
+    parts = [
+        head,
+        f"改动 {changed} 条（规则词典 {stats.dictionary} / LLM {stats.llm}），保留 {kept} 条",
+    ]
+    detail: List[str] = []
+    if stats.veto:
+        detail.append(f"红线拦截 {stats.veto}")
+    if stats.budget:
+        detail.append(f"预算用尽 {stats.budget}")
+    if stats.noop:
+        detail.append(f"模型未改动 {stats.noop}")
+    if stats.failed:
+        detail.append(f"调用失败 {stats.failed}")
+    if detail:
+        parts.append("（" + "、".join(detail) + "）")
+    if blocked:
+        parts.append(f"另有 {blocked} 条否定/背景内容未进入润色")
+    return "，".join(parts) + "。Markdown 和 HTML 已正常生成。"
 
 
 def _dictionary_item(fact: ResumeFact, level: str) -> Optional[ResumePolishItem]:
@@ -557,7 +620,7 @@ def _llm_items(
                     {"role": "user", "content": _llm_payload(chunk, level)},
                 ],
                 max_tokens=1200,
-                temperature=0.2,
+                temperature=0.3,
             )
             calls += 1
             parsed = _parse_llm_items(reply)
@@ -578,7 +641,23 @@ def _llm_items(
                 continue
             if not polished or len(polished) > MAX_POLISH_CHARS:
                 continue
-            if not _safe_rewrite(fact, polished, level.key):
+            if clean_text(polished) == clean_text(fact.text):
+                # 模型把原句原样退回来了：这不是“越界”，单独标出，方便区分。
+                items.append(
+                    ResumePolishItem(
+                        ref=fact.ref,
+                        original=fact.text,
+                        polished=fact.text,
+                        engine="original",
+                        status="模型未改动",
+                        reason="模型返回与原文相同，已保留原文",
+                        candidate=polished,
+                    )
+                )
+                used.add(ref)
+                continue
+            vetoes = _rewrite_vetoes(fact, polished, level.key)
+            if vetoes:
                 items.append(
                     ResumePolishItem(
                         ref=fact.ref,
@@ -586,7 +665,9 @@ def _llm_items(
                         polished=fact.text,
                         engine="original",
                         status="安全校验未通过",
-                        reason="润色结果可能新增或夸大事实，已保留原文",
+                        reason="；".join(vetoes),
+                        candidate=polished,
+                        vetoes=vetoes,
                     )
                 )
                 used.add(ref)
@@ -657,43 +738,65 @@ def _parse_llm_items(reply: str) -> List[Dict[str, str]]:
 
 def _safe_rewrite(fact: ResumeFact, polished: str, level: str = "L2") -> bool:
     """Reject rewrites that change facts, strength, ownership, delivery, or numbers."""
+    return not _rewrite_vetoes(fact, polished, level)
+
+
+def _rewrite_vetoes(fact: ResumeFact, polished: str, level: str = "L2") -> List[str]:
+    """Return the human-readable reasons a rewrite was blocked (empty = safe).
+
+    Red lines stay hard: numbers, ownership, competence, entities, delivery
+    state and fabricated capabilities are never relaxed. The change is that
+    each rejection now carries its reason instead of one opaque boolean.
+    """
     value = clean_text(polished).strip()
     original = clean_text(fact.text).strip()
-    if not value or value == original:
-        return False
-    if len(value) > MAX_POLISH_CHARS or len(value) > int(len(original) * MAX_POLISH_RATIO) + 24:
-        return False
+    reasons: List[str] = []
+    if not value:
+        return ["润色结果为空"]
+    if value == original:
+        return ["模型返回与原文相同"]
+    if len(value) > MAX_POLISH_CHARS:
+        reasons.append(f"超过字数上限 {MAX_POLISH_CHARS}")
+    elif len(value) > int(len(original) * MAX_POLISH_RATIO) + 24:
+        reasons.append("改动幅度过大")
     if _verdict_hit(value):
-        return False
+        reasons.append("出现结论性措辞")
     if not _numbers_safe(original, value, level):
-        return False
+        reasons.append("新增或改动了原文数字")
     if _ownership_signature(original) != _ownership_signature(value):
-        return False
+        reasons.append("改动了责任/主导程度")
     if _competence_signature(original) != _competence_signature(value):
-        return False
+        reasons.append("升级或降级了能力等级")
     if _entity_signature(original) != _entity_signature(value):
-        return False
+        reasons.append("新增或改动了公司/学校/项目名")
 
     original_actions = _action_signature(original)
     if fact.level == EVIDENCE_MENTION and _has_any(value, ACTION_MARKERS):
-        return False
+        reasons.append("把「仅提及」升级成了「做过」")
     if _action_signature(value) - original_actions:
-        return False
+        reasons.append("新增了原文没有的动作类型")
     if fact.level == EVIDENCE_ACTION and _has_any(value, DELIVERY_MARKERS):
-        return False
+        reasons.append("把「有动作」升级成了「有交付」")
     if fact.level != EVIDENCE_RESULT and _has_delivery(value):
-        return False
+        reasons.append("新增了交付/上线表述")
     if _delivery_signature(original) != _delivery_signature(value):
-        return False
-    if fact.level == EVIDENCE_MENTION and not _has_any(value, ("了解", "接触", "用过", "使用", "熟悉", "掌握")):
-        return False
+        reasons.append("改动了交付状态")
+    # 只保护真正的“能力限定词”；「使用」是普通动作词，术语表本身就要把它换成「基于」。
+    _HEDGE_WORDS = ("了解", "接触", "用过", "熟悉", "掌握")
+    if (
+        fact.level == EVIDENCE_MENTION
+        and _has_any(original, _HEDGE_WORDS)
+        and not _has_any(value, _HEDGE_WORDS)
+    ):
+        # 原文带着「了解/熟悉」这类限定词时，改写不能把它们丢掉（丢了就等于升级）。
+        # 原文本来就没有限定词的（如纯技能清单），不在此列。
+        reasons.append("「仅提及」级别丢失了原有能力措辞")
     if not original_actions and _has_any(value, ACTION_MARKERS):
-        return False
-
+        reasons.append("新增了原文没有的动作表述")
     # A paraphrase may use synonyms, but it must not add a known capability.
     if _new_capabilities(original, value):
-        return False
-    return True
+        reasons.append("新增了原文没有的技能关键词")
+    return reasons
 
 
 def _verdict_hit(text: str) -> bool:
@@ -855,9 +958,35 @@ def _apply_replacements(resume: Resume, replacements: Dict[str, str], style: str
     return resume
 
 
+def _match_key(text: str) -> str:
+    """把空白与全半角标点归一化，用于把润色结果更稳地写回原文。"""
+    value = clean_text(str(text or ""))
+    for full, half in (
+        ("，", ","), ("。", "."), ("；", ";"), ("：", ":"), ("、", ","),
+        ("！", "!"), ("？", "?"), ("（", "("), ("）", ")"),
+    ):
+        value = value.replace(full, half)
+    return re.sub(r"[\s\u3000]+", "", value).strip()
+
+
 def _replace_line(line: str, replacements: Dict[str, str]) -> str:
-    key = clean_text(str(line or "")).strip()
-    return replacements.get(key, line)
+    """找对应润色：先精确匹配，再忽略空白/标点差异，最后整句包含兜底。"""
+    raw = str(line or "")
+    key = clean_text(raw).strip()
+    if key in replacements:
+        return replacements[key]
+    normalized = _match_key(raw)
+    if not normalized:
+        return raw
+    for source, polished in replacements.items():
+        if _match_key(source) == normalized:
+            return polished
+    # 兜底：整句包含某条原文（归一化后），长度足够才替换，避免误伤短词。
+    for source, polished in replacements.items():
+        source_key = _match_key(source)
+        if len(source_key) >= 8 and source_key in normalized:
+            return polished
+    return raw
 
 
 

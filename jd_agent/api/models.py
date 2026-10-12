@@ -104,6 +104,8 @@ class ResumePolishItem(BaseModel):
     engine: str = "original"
     status: str = "保留原文"
     reason: str = ""
+    candidate: str = ""
+    vetoes: List[str] = Field(default_factory=list)
 
 
 class ResumePolishStats(BaseModel):
@@ -113,6 +115,10 @@ class ResumePolishStats(BaseModel):
     original: int = 0
     blocked: int = 0
     calls: int = 0
+    noop: int = 0
+    veto: int = 0
+    budget: int = 0
+    failed: int = 0
 
 
 class ResumePolishResponse(BaseModel):
