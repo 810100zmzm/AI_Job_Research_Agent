@@ -48,10 +48,10 @@ v2.4 加了 **分层记忆与知识库**：记忆分 L0 会话 / L1 短时 / L2 
 配好 MongoDB / Qdrant / 通义 `text-embedding-v4` 后可切换后端。检索结果只进入 `state.context` 作为补充，
 **不改规则结论、理由、风险与 Decision**。所有运行时数据只允许落在项目同一个磁盘的 `data/` 下。
 
-v3 完成**前后端联调**：Vue3 前端（输入 / 进度 / 报告 / 历史四页）+ FastAPI 后端（7 个接口 + SSE 流式），
+v3.1 完成**前后端联调**：Vue3 前端（输入 / 进度 / 报告 / 简历润色 / 历史五页）+ FastAPI 后端（14 个接口 + SSE 流式），
 把判断与润色这条主链完整搬到 Web 上——上传 JD 与简历、实时看 Trace、切换 md / json / html 三种报告、
-一键生成润色版简历（md / html，可下载）、顺手记投递。核心逻辑一行没动，
-后端只做「包装」，前端只做「展示」；离线原则不变，不配后端就退回命令行。
+Ask 就地补答、一键生成润色版简历（md / html，可下载）、顺手记投递，核心逻辑一行没动，
+后端只做「包装」，前端只做「展示」；离线原则不变，不配后端就退回命令行 / Streamlit。
 
 ---
 
@@ -60,7 +60,7 @@ v3 完成**前后端联调**：Vue3 前端（输入 / 进度 / 报告 / 历史�
 ### 在 PyCharm 里
 
 1. `File > Open` → 选择你克隆下来的项目目录
-2. 解释器选任意 Python 3.9+，然后 `pip install -r requirements.txt`（python-dotenv + langgraph）
+2. 解释器选任意 Python 3.9+，然后 `pip install -r requirements.txt`（python-dotenv + langgraph + fastapi/uvicorn）
 3. 右键 `main.py` → **Run 'main'**（不指定 `--jd` 时会把 `input/jd` 下所有岗位各跑一遍）
 4. 结果写在 `output/`：单个岗位是 `resume_decision.md｜json｜html`，多个岗位按岗位分文件
 
@@ -90,6 +90,20 @@ python main.py --enable-knowledge --knowledge-tiers L1,L2   # 检索静态 / 半
 
 .venv\Scripts\python.exe -m streamlit run streamlit_app.py      # 可选：网页版前端
 ```
+
+### Web 前端（Vue3 + FastAPI，可选）
+
+```bash
+# 一条命令同时起后端与前端（PowerShell，自动用 .venv；Ctrl+C 一起停）
+powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
+# 前端 http://127.0.0.1:5173，后端 http://127.0.0.1:8000
+
+# 或分开起：
+uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
+cd frontend; npm install; npm run dev              # 首次要先 npm install
+```
+
+前端五页：输入 / 进度 / 报告 / 简历润色 / 历史；后端接口清单见 [`BACKEND.md`](BACKEND.md)。
 
 **要分析哪份 md**：JD 用 `--jd`（不给就是 `input/jd` 下全部岗位），第二个输入用 `--project`。
 第二个输入不限于 `input/project/`，你自己的简历 md 也能直接喂进去，例如：
@@ -853,9 +867,15 @@ Trace 同时会打印在终端上，并且**每个字段都能回查原文**（`
 AI_Job_Research_Agent/
 ├── main.py                  # 入口（PyCharm 直接 Run）
 ├── streamlit_app.py         # 可选：Streamlit 前端（复用同一套 jd_agent）
+├── api/main.py              # FastAPI 后端入口（uvicorn api.main:app --reload）
+├── BACKEND.md               # 后端接口清单
+├── frontend/                # Vue3 + Vite 前端（输入 / 进度 / 报告 / 简历润色 / 历史五页）
+├── scripts/dev.ps1          # 一条命令同时起后端与前端
 ├── .streamlit/config.toml   # 可选：前端主题（浅色、克制）
-├── requirements.txt         # 依赖：python-dotenv（可选大模型层）+ langgraph（三张 Agent 图）
+├── requirements.txt         # 依赖：python-dotenv + langgraph（三张 Agent 图）+ fastapi/uvicorn（后端）
 ├── .env.example             # 可选：接大模型时的 key 模板（.env 已被忽略）
+├── knowledge/               # L1 静态知识（方法论 / 词典 / 业务规则）
+├── data/                    # 运行时数据：记忆 / 知识索引 / 上传临时文件（已忽略）
 ├── input/
 │   ├── jd/                  # 岗位描述（一份 JD；文件里可含多个岗位）
 │   ├── project/             # 项目描述（一个项目一份文件）
@@ -887,6 +907,7 @@ AI_Job_Research_Agent/
     ├── polish_brief.py      # Polish Agent 的规则层：要求 ↔ 事实对照 + 缺口 + 反向证据 + 风险
     ├── polish_llm.py        # 三块 LLM 内容（建议写法 / 追问预演 / 润色）的提示词、校验与降级
     ├── polish_graph.py      # Polish Agent（LangGraph）：已核验事实 + JD 要求 → 写法建议
+    ├── api/                 # FastAPI 后端：routers / services / stores（14 个接口）
     ├── tools/               # 工具区：命令行与前端共用，一个工具 = Tool 子类 + run()
     │   ├── base.py          # Tool / ToolResult：工具的公共契约
     │   ├── resume.py        # 简历排版：读简历 md → 有序的 md / html（纯规则）+ ResumeTool
