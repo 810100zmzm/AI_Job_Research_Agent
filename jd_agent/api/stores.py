@@ -283,6 +283,8 @@ class TaskState:
     user_id: str = "default"
     jd_input: str = ""
     resume_input: str = ""
+    strategy: str = "rule"
+    max_steps: int = 10
     answer: str = ""
     question: str = ""
     question_reason: str = ""
@@ -367,6 +369,8 @@ class TaskStore:
         user_id: str,
         jd_input: str,
         resume_input: str,
+        strategy: str = "rule",
+        max_steps: int = 10,
     ) -> None:
         """Keep the original request so an Ask can resume without re-uploading."""
         with self._lock:
@@ -377,6 +381,8 @@ class TaskStore:
             task.user_id = str(user_id or "default")
             task.jd_input = str(jd_input)
             task.resume_input = str(resume_input)
+            task.strategy = str(strategy or "rule")
+            task.max_steps = max(1, int(max_steps))
             task.updated_at = time.time()
 
     def run_context(self, task_id: str) -> Optional[Dict[str, str]]:
@@ -389,6 +395,8 @@ class TaskStore:
                 "user_id": task.user_id,
                 "jd_input": task.jd_input,
                 "resume_input": task.resume_input,
+                "strategy": task.strategy,
+                "max_steps": str(task.max_steps),
             }
 
     def wait_for_answer(self, task_id: str, question: str, question_reason: str = "") -> None:

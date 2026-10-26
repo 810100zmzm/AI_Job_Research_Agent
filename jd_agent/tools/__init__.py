@@ -52,6 +52,7 @@ from .jd_struct import (
     render_jd_markdown,
     structure_jd_text,
 )
+from .memory import RECALL_TOOL, REMEMBER_TOOL, RecallTool, RememberTool
 from .resume_evidence import (
     RESUME_EVIDENCE_TOOL,
     ResumeEvidenceTool,
@@ -79,6 +80,7 @@ from .resume_struct import (
     structure_resume_text,
 )
 from .resume import (
+    RESUME_DEFAULT_FORMATS,
     RESUME_FORMATS,
     RESUME_STEM,
     RESUME_TOOL,
@@ -90,6 +92,7 @@ from .resume import (
     build_resume,
     default_stem,
     parse_resume,
+    render_json,
     render_html,
     render_markdown,
     resume_summary,
@@ -104,6 +107,8 @@ TOOLS: Tuple[Tool, ...] = (
     RESUME_EVIDENCE_TOOL,
     RESUME_NEGATION_TOOL,
     CAP_MATCH_TOOL,
+    RECALL_TOOL,
+    REMEMBER_TOOL,
 )
 TOOL_BY_SLUG = {tool.slug: tool for tool in TOOLS}
 
@@ -128,6 +133,7 @@ __all__ = [
     "RESUME_TOOL",
     "ResumeTool",
     "RESUME_FORMATS",
+    "RESUME_DEFAULT_FORMATS",
     "RESUME_STEM",
     "default_stem",
     "Resume",
@@ -137,6 +143,7 @@ __all__ = [
     "build_resume",
     "parse_resume",
     "render_markdown",
+    "render_json",
     "render_html",
     "resume_summary",
     "write_resume_files",
@@ -184,4 +191,8 @@ __all__ = [
     "CapMatchTool",
     "render_cap_match_markdown",
     "compare_counts",
+    "RECALL_TOOL",
+    "REMEMBER_TOOL",
+    "RecallTool",
+    "RememberTool",
 ]

@@ -11,4 +11,4 @@
 更完整的目录与依赖说明见 `jd_agent/README.md`。
 """
 
-__version__ = "2.3.0"
+__version__ = "4.0.0"

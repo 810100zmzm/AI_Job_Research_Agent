@@ -193,6 +193,26 @@ class TestBatchRun(TempCase):
         names = sorted(item.name for item in (self.tmp / "batch").glob("*"))
         self.assertEqual(
             names,
+            ["resume_decision_jd_1.json", "resume_decision_jd_2.json"],
+        )
+        first = self._payload("batch", "resume_decision_jd_1.json")
+        second = self._payload("batch", "resume_decision_jd_2.json")
+        self.assertEqual(first["jd"]["title"], "岗位一：大模型应用实习生")
+        self.assertEqual(second["jd"]["title"], "岗位二：AI 产品实习生")
+
+    def test_explicit_formats_still_write_markdown_and_html(self) -> None:
+        self._write(self.jd_dir / "jd.md", JD_TWO_POSITIONS)
+        with self._patch_dirs():
+            code = cli.main(
+                [
+                    "--project", str(self.project), "--out", str(self.tmp / "three"),
+                    "--formats", "md,json,html", "--quiet",
+                ]
+            )
+        self.assertEqual(code, cli.EXIT_OK)
+        names = sorted(item.name for item in (self.tmp / "three").glob("*"))
+        self.assertEqual(
+            names,
             [
                 "resume_decision_jd_1.html",
                 "resume_decision_jd_1.json",
@@ -202,10 +222,6 @@ class TestBatchRun(TempCase):
                 "resume_decision_jd_2.md",
             ],
         )
-        first = self._payload("batch", "resume_decision_jd_1.json")
-        second = self._payload("batch", "resume_decision_jd_2.json")
-        self.assertEqual(first["jd"]["title"], "岗位一：大模型应用实习生")
-        self.assertEqual(second["jd"]["title"], "岗位二：AI 产品实习生")
 
     def test_single_posting_keeps_the_v10_file_name(self) -> None:
         self._write(self.jd_dir / "noreq.md", JD_NO_REQUIREMENT)
@@ -342,10 +358,21 @@ class TestResumeCli(TempCase):
     def _resume_file(self) -> Path:
         return self._write(self.resume_dir / "我的简历.md", RESUME)
 
-    def test_build_resume_writes_both_files(self) -> None:
+    def test_build_resume_defaults_to_json_only(self) -> None:
         self._resume_file()
         with self._patch_dirs():
             code = cli.main(["--build-resume", "--out", str(self.tmp / "docs"), "--quiet"])
+        self.assertEqual(code, cli.EXIT_OK)
+        names = sorted(item.name for item in (self.tmp / "docs").glob("*"))
+        self.assertEqual(names, ["resume.json"])
+        self.assertIn("\"name\": \"周每每\"", (self.tmp / "docs" / "resume.json").read_text(encoding="utf-8"))
+
+    def test_build_resume_can_export_markdown_and_html(self) -> None:
+        self._resume_file()
+        with self._patch_dirs():
+            code = cli.main(
+                ["--build-resume", "--resume-format", "md,html", "--out", str(self.tmp / "docs"), "--quiet"]
+            )
         self.assertEqual(code, cli.EXIT_OK)
         self.assertTrue((self.tmp / "docs" / "resume.md").is_file())
         self.assertTrue((self.tmp / "docs" / "resume.html").is_file())
@@ -363,6 +390,8 @@ class TestResumeCli(TempCase):
             code = cli.main(
                 [
                     "--build-resume",
+                    "--resume-format",
+                    "md",
                     "--resume-file",
                     str(other),
                     "--resume-project",
@@ -390,7 +419,10 @@ class TestResumeCli(TempCase):
         self._resume_file()
         with self._patch_dirs():
             code = cli.main(
-                ["--build-resume", "--resume-style", "accent", "--out", str(self.tmp / "accent"), "--quiet"]
+                [
+                    "--build-resume", "--resume-style", "accent",
+                    "--resume-format", "md,html", "--out", str(self.tmp / "accent"), "--quiet",
+                ]
             )
         self.assertEqual(code, cli.EXIT_OK)
         page = (self.tmp / "accent" / "resume-accent.html").read_text(encoding="utf-8")
@@ -404,6 +436,8 @@ class TestResumeCli(TempCase):
             code = cli.main(
                 [
                     "--build-resume",
+                    "--resume-format",
+                    "md",
                     "--resume-style",
                     "structure",
                     "--resume-name",
@@ -433,7 +467,12 @@ class TestResumeCli(TempCase):
 
         with self._patch_dirs(), mock.patch("jd_agent.tools.resume.read_text", wraps=tools.resume.read_text):
             with mock.patch("jd_agent.agents.agent.OpenAICompatClient", Bomb):
-                code = cli.main(["--build-resume", "--llm", "--out", str(self.tmp / "offline"), "--quiet"])
+                code = cli.main(
+                    [
+                        "--build-resume", "--resume-format", "html",
+                        "--llm", "--out", str(self.tmp / "offline"), "--quiet",
+                    ]
+                )
         self.assertEqual(code, cli.EXIT_OK)
         self.assertTrue((self.tmp / "offline" / "resume.html").is_file())
 

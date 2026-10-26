@@ -139,7 +139,7 @@ JD 与简历各自支持 **文本 / 文件 / 图片 / 网址** 四类输入，�
 1. `File > Open` 选择项目目录；
 2. 解释器选任意 Python 3.9+，运行 `pip install -r requirements.txt`（python-dotenv + langgraph + fastapi/uvicorn）；
 3. 右键 `main.py` → **Run 'main'**（不指定 `--jd` 时会把 `input/jd` 下所有岗位各跑一遍）；
-4. 结果写在 `output/`：单个岗位是 `resume_decision.md｜json｜html`，多个岗位按岗位分文件。
+4. 结果写在 `output/`：**目录里只有 JSON**，单个岗位是 `resume_decision.json`，多个岗位按岗位分文件；需要 Markdown / HTML 再加 `--formats md,html` 导出。
 
 ### 命令行
 
@@ -151,10 +151,10 @@ python main.py --jd input/jd/xx.md --jd-title 岗位二    # 指定这个文件�
 python main.py --answer "这个项目的结果是……"            # 回答 Agent 提出的那一个问题
 python main.py --project input/profile/资料不足项目测试简历1.md   # 第二个输入可以是任何 md
 
-python main.py --build-resume                          # 简历排版 → output/resume.md + output/resume.html
+python main.py --build-resume                          # 简历排版 → output/resume.json（要 md/html 加 --resume-format md,html）
 python main.py --build-resume --resume-style structure # 换风格（classic / structure / accent）
 
-python main.py --jd-agent --jd-text "岗位职责：……"       # JD Agent：JD（文本/图片/网址）→ output/jd.md
+python main.py --jd-agent --jd-text "岗位职责：……"       # JD Agent：JD（文本/图片/网址）→ 只打印，要导出加 --jd-out
 python main.py --jd-agent --jd-url "https://…/job/1"    # 网址：抓一次 HTML → Markdown
 python main.py --jd-agent --jd-image assets/jd.png --jd-trace
 python main.py --resume-agent --cv-file input/profile/xx.md --cv-trace   # 简历 → 事实条目 + 证据等级
@@ -162,6 +162,8 @@ python main.py --polish-agent --jd-file input/jd/xx.md --cv-file input/profile/x
 python main.py --polish-agent --jd-file … --cv-file … --polish-trace
 
 python main.py --llm                                   # 启用 LLM 策略（text 层，需 .env）
+python main.py --strategy llm                          # v4：有界 plan → act → observe + verify（需 .env）
+python main.py --llm --strategy rule                   # 兼容旧装饰层：规则结案后补草稿 / 润色
 python main.py --vision                                # 启用图片层：Qwen-VL 把图片读成文字事实（需 .env）
 python main.py --enable-memory --session-id demo       # 启用 L0/L1/L2 记忆，L2 写入 data/memory/
 python main.py --enable-knowledge --knowledge-tiers L1,L2   # 启用知识检索
@@ -192,12 +194,10 @@ cd frontend; npm install; npm run dev              # 首次要先 npm install
 
 | 产物 | 说明 |
 |------|------|
-| `output/resume_decision.md｜json｜html` | 主链判断报告：结论、理由、风险、`StopReason` |
-| `output/resume_decision_<jd_id>.*` | 批量模式：多个岗位按岗位分文件 |
-| `output/resume.md｜resume-<风格>.md｜html` | `--build-resume` 排好版的简历 |
-| `output/jd.md` + `jd.trace.md` | JD Agent 转出的 JD；加 `--jd-trace` 附完整 Trace |
-| `output/resume_facts.md` + `.trace.md` | Resume Agent 的事实清单；加 `--cv-trace` 附完整 Trace |
-| `output/polish.md` + `.trace.md` | Polish Agent 的建议写法 / 追问预演 / 润色；加 `--polish-trace` 附完整 Trace |
+| `output/resume_decision.json` | 主链判断报告：结论、理由、风险、`StopReason`、完整 Trace。**`output/` 只收 JSON** |
+| `output/resume_decision_<jd_id>.json` | 批量模式：多个岗位按岗位分文件 |
+| `output/resume.json` | `--build-resume` 排好版的简历；要 md/html 加 `--resume-format md,html` |
+| JD / Resume / Polish Agent | 默认只把结果打印到终端；要导出加 `--jd-out` / `--cv-out` / `--polish-out` |
 
 Trace 同时打印在终端，**每个字段都能回查原文**（`文件::L行号`）。
 

@@ -38,6 +38,7 @@ Polish Agent（LangGraph）：基于「已核验事实 + JD 要求」给建议�
     少给一路来源直接退出码 2，撑不起一份建议时退出码 3。
 
 可选的大模型能力（默认关闭，不联网；先配好项目根 .env）：
+    python main.py --strategy llm                  # v4 有界 plan-act-observe + verify（推荐演示）
     python main.py --llm                            # 报告生成后：写法草稿 + 报告润色（两块都带 source）
     python main.py --llm --llm-max-calls 3          # 限制本次运行的 LLM 调用次数（默认 10，多岗位共用）
     python main.py --vision                         # Qwen-VL 把项目里引用的图片读成文字事实
@@ -58,7 +59,7 @@ from . import __version__
 from .agents.agent import MAX_ROUNDS, build_text_budget, run_agent
 from .domain.jd import load_jd, load_jd_positions
 from .services.jd_source import SOURCE_URL, describe_sources, detect_sources, unusable_notes
-from .tools import RESUME_FORMATS, RESUME_TOOL, resume_styles, tool_help_lines
+from .tools import RESUME_DEFAULT_FORMATS, RESUME_TOOL, resume_styles, tool_help_lines
 from .core.schema import JobPosting
 from .core.settings import (
     DEFAULT_DATA_DIR,
@@ -82,7 +83,9 @@ PROJECT_DIR = INPUT_DIR / "project"
 RESUME_DIR = INPUT_DIR / "profile"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 REPORT_STEM = "resume_decision"
-FORMATS = ("md", "json", "html")
+# output/ 只落 JSON：报告默认就是 JSON，md / html 仍是可选导出格式。
+FORMATS = ("json",)
+ALL_FORMATS = ("md", "json", "html")
 EXIT_OK = 0
 EXIT_ERROR = 2
 EXIT_ASK = 3
@@ -144,7 +147,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="JD 网址（可重复）；每个地址发 1 次 HTTP GET，只抓你给的那个页面",
     )
     parser.add_argument("--jd-name", dest="jd_name", help="这份 JD 的标题（默认取原文里第一个标题）")
-    parser.add_argument("--jd-out", dest="jd_out", help=f"输出的 Markdown 路径（默认 {OUTPUT_DIR / 'jd.md'}）")
+    parser.add_argument(
+        "--jd-out",
+        dest="jd_out",
+        help="导出路径；不给就只打印到终端，不在 output/ 落盘（output/ 只收 JSON）",
+    )
     parser.add_argument(
         "--jd-trace",
         dest="jd_trace",
@@ -155,7 +162,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--resume-agent",
         dest="resume_agent",
         action="store_true",
-        help="Resume Agent（LangGraph）：把简历拆成事实条目并判证据等级，写出 output/resume_facts.md",
+        help="Resume Agent（LangGraph）：把简历拆成事实条目并判证据等级（默认只打印到终端）",
     )
     parser.add_argument(
         "--cv-text",
@@ -182,7 +189,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cv-title", dest="cv_title", help="这份简历的标题（默认取原文里第一个标题）")
     parser.add_argument(
-        "--cv-out", dest="cv_out", help=f"输出的 Markdown 路径（默认 {OUTPUT_DIR / 'resume_facts.md'}）"
+        "--cv-out", dest="cv_out", help="导出路径；不给就只打印到终端，不在 output/ 落盘"
     )
     parser.add_argument(
         "--cv-trace",
@@ -196,11 +203,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Polish Agent（LangGraph）：JD + 简历 -> 建议写法 / 追问预演 / 润色，"
-            f"写出 {OUTPUT_DIR / 'polish.md'}"
+            "默认只打印到终端（--polish-out 可导出到文件）"
         ),
     )
     parser.add_argument(
-        "--polish-out", dest="polish_out", help=f"输出的 Markdown 路径（默认 {OUTPUT_DIR / 'polish.md'}）"
+        "--polish-out", dest="polish_out", help="导出路径；不给就只打印到终端，不在 output/ 落盘"
     )
     parser.add_argument(
         "--polish-trace",
@@ -232,8 +239,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume-format",
         dest="resume_formats",
-        default=",".join(RESUME_FORMATS),
-        help="简历输出格式，逗号分隔：md,html（默认两个都出）",
+        default=",".join(RESUME_DEFAULT_FORMATS),
+        help="简历输出格式，逗号分隔：json（默认）；可选 md,html",
     )
     parser.add_argument(
         "--resume-style",
@@ -288,7 +295,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"运行时数据目录（默认 {DEFAULT_DATA_DIR}，始终建议放在 D 盘项目内）",
     )
     parser.add_argument("--out", help=f"输出目录（默认 {OUTPUT_DIR}）")
-    parser.add_argument("--formats", default=",".join(FORMATS), help="输出格式，逗号分隔：md,json,html")
+    parser.add_argument(
+        "--formats", default=",".join(FORMATS), help="输出格式，逗号分隔：json（默认）；可选 md,json,html"
+    )
     parser.add_argument(
         "--llm",
         action="store_true",
@@ -299,11 +308,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--strategy",
+        choices=("rule", "llm"),
+        default="rule",
+        help="v4 Agent 策略：rule 默认离线；llm 启用有界 plan-act-observe + verify",
+    )
+    parser.add_argument(
         "--llm-max-calls",
         dest="llm_max_calls",
         type=int,
         default=DEFAULT_CALL_LIMIT,
         help=f"LLM 装饰层的调用上限，含重试（默认 {DEFAULT_CALL_LIMIT}）",
+    )
+    parser.add_argument(
+        "--max-steps",
+        dest="max_steps",
+        type=int,
+        default=10,
+        help="v4 llm 策略的 plan-act-observe 步数上限（默认 10）",
     )
     parser.add_argument(
         "--vision",
@@ -617,7 +639,8 @@ def run_jd_agent_mode(args, vision_client: Optional[OpenAICompatClient] = None) 
             _say(f"  - {note}")
         return EXIT_ERROR
 
-    out_path = Path(args.jd_out).expanduser() if args.jd_out else OUTPUT_DIR / "jd.md"
+    # 不给 --jd-out 就不落盘：output/ 只收 JSON，Markdown 只打印到终端。
+    out_path = Path(args.jd_out).expanduser() if args.jd_out else None
     if not args.quiet:
         _say(f"[输入] {len(usable)} 个可用来源：{describe_sources(usable)}")
         if any(source.kind == SOURCE_URL for source in usable):
@@ -629,18 +652,21 @@ def run_jd_agent_mode(args, vision_client: Optional[OpenAICompatClient] = None) 
         settings=settings,
         vision_client=client,
         sources=sources,
-        out_dir=out_path.parent,
-        stem=out_path.stem,
+        out_dir=out_path.parent if out_path else None,
+        stem=out_path.stem if out_path else "jd",
     )
     if not args.quiet:
         for line in render_jd_console(state):
             _say(line)
-    if args.jd_trace:
+    if args.jd_trace and out_path is not None:
         trace_path = out_path.with_suffix(".trace.md")
         trace_path.write_text(render_jd_trace(state), encoding="utf-8")
         if not args.quiet:
             _say(f"Trace 已写出：{trace_path}")
             _say("")
+    elif args.jd_trace and not args.quiet:
+        _say("[提示] --jd-trace 需要配合 --jd-out 使用（output/ 只收 JSON）；本次只打印终端 Trace。")
+        _say("")
     return EXIT_ASK if state.needs_answer else EXIT_OK
 
 
@@ -702,7 +728,8 @@ def run_resume_agent_mode(args, vision_client: Optional[OpenAICompatClient] = No
             _say(f"  - {note}")
         return EXIT_ERROR
 
-    out_path = Path(args.cv_out).expanduser() if args.cv_out else OUTPUT_DIR / "resume_facts.md"
+    # 不给 --cv-out 就不落盘：output/ 只收 JSON，Markdown 只打印到终端。
+    out_path = Path(args.cv_out).expanduser() if args.cv_out else None
     if not args.quiet:
         _say(f"[输入] {len(usable)} 个可用来源：{describe_sources(usable)}")
         _say("[输入] 判定顺序：先挡「写了但没做过」（否定 / 背景），再判证据等级")
@@ -713,18 +740,21 @@ def run_resume_agent_mode(args, vision_client: Optional[OpenAICompatClient] = No
         settings=settings,
         vision_client=client,
         sources=sources,
-        out_dir=out_path.parent,
-        stem=out_path.stem,
+        out_dir=out_path.parent if out_path else None,
+        stem=out_path.stem if out_path else "resume_facts",
     )
     if not args.quiet:
         for line in render_resume_console(state):
             _say(line)
-    if args.cv_trace:
+    if args.cv_trace and out_path is not None:
         trace_path = out_path.with_suffix(".trace.md")
         trace_path.write_text(render_resume_trace(state), encoding="utf-8")
         if not args.quiet:
             _say(f"Trace 已写出：{trace_path}")
             _say("")
+    elif args.cv_trace and not args.quiet:
+        _say("[提示] --cv-trace 需要配合 --cv-out 使用（output/ 只收 JSON）；本次只打印终端 Trace。")
+        _say("")
     return EXIT_ASK if state.needs_answer else EXIT_OK
 
 
@@ -805,7 +835,8 @@ def run_polish_agent_mode(
             _say(f"  - {note}")
         return EXIT_ERROR
 
-    out_path = Path(args.polish_out).expanduser() if args.polish_out else OUTPUT_DIR / "polish.md"
+    # 不给 --polish-out 就不落盘：output/ 只收 JSON，Markdown 只打印到终端。
+    out_path = Path(args.polish_out).expanduser() if args.polish_out else None
     if not args.quiet:
         _say(f"[输入] JD 侧 {len(usable_jd)} 个可用来源：{describe_sources(usable_jd)}")
         _say(f"[输入] 简历侧 {len(usable_cv)} 个可用来源：{describe_sources(usable_cv)}")
@@ -819,19 +850,22 @@ def run_polish_agent_mode(
         vision_client=client,
         jd_sources=jd_sources,
         cv_sources=cv_sources,
-        out_dir=out_path.parent,
-        stem=out_path.stem,
+        out_dir=out_path.parent if out_path else None,
+        stem=out_path.stem if out_path else "polish",
         llm_max_calls=max(1, args.llm_max_calls),
     )
     if not args.quiet:
         for line in render_polish_console(state):
             _say(line)
-    if args.polish_trace:
+    if args.polish_trace and out_path is not None:
         trace_path = out_path.with_suffix(".trace.md")
         trace_path.write_text(render_polish_trace(state), encoding="utf-8")
         if not args.quiet:
             _say(f"Trace 已写出：{trace_path}")
             _say("")
+    elif args.polish_trace and not args.quiet:
+        _say("[提示] --polish-trace 需要配合 --polish-out 使用（output/ 只收 JSON）；本次只打印终端 Trace。")
+        _say("")
     return EXIT_ASK if state.needs_answer else EXIT_OK
 
 
@@ -847,6 +881,9 @@ def main(
     args = build_arg_parser().parse_args(argv)
     use_llm = bool(args.llm)
     use_vision = bool(args.vision)
+    strategy = str(getattr(args, "strategy", "rule") or "rule")
+    if strategy == "llm":
+        use_llm = True
     use_memory = bool(args.enable_memory)
     use_knowledge = bool(args.enable_knowledge or args.index_knowledge or args.index_only)
     settings: Optional[LLMSettings] = None
@@ -930,7 +967,7 @@ def main(
             return EXIT_OK
 
     formats = [item.strip().lower() for item in args.formats.split(",") if item.strip()]
-    unknown = [item for item in formats if item not in FORMATS]
+    unknown = [item for item in formats if item not in ALL_FORMATS]
     if unknown:
         _say(f"[错误] 不支持的输出格式：{', '.join(unknown)}（可选 md / json / html）")
         return EXIT_ERROR
@@ -973,6 +1010,8 @@ def main(
             llm=use_llm,
             vision=use_vision,
             llm_max_calls=max(1, args.llm_max_calls),
+            strategy=strategy,
+            max_steps=max(1, args.max_steps),
             settings=settings,
             text_client=text_client,
             vision_client=vision_client,

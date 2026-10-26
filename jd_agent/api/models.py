@@ -33,6 +33,8 @@ class AnalyzeRequest(BaseModel):
     resume_input: str = Field(min_length=1)
     session_id: str = "default"
     user_id: str = "default"
+    strategy: Literal["rule", "llm"] = "rule"
+    max_steps: int = Field(default=10, ge=1, le=50)
 
 
 class AnalyzeResponse(BaseModel):

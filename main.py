@@ -10,6 +10,7 @@ PyCharm 直接右键 Run 'main' 即可；命令行：
     python main.py --resume-agent --cv-file input/profile/我的简历.md   # Resume Agent：简历 -> 事实条目 + 证据等级
     python main.py --polish-agent --jd-file input/jd/xx.md --cv-file input/profile/我的简历.md   # Polish Agent：建议写法 / 追问预演 / 润色
     python main.py --help                # 全部参数（含 --llm / --vision / --answer）
+    python main.py --strategy llm        # v4：有界 plan-act-observe + verify（需 .env）
 """
 from __future__ import annotations
 

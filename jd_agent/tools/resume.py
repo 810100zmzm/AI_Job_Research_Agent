@@ -29,8 +29,9 @@
 from __future__ import annotations
 
 import html as html_lib
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -284,7 +285,9 @@ def build_resume(path, projects: Sequence = (), style: str = DEFAULT_STYLE) -> R
 
 # ---- Markdown 输出 ----------------------------------------------------------
 
-RESUME_FORMATS = ("md", "html")
+# output/ 只收 JSON：简历排版默认导出 resume.json，md / html 仍可按需导出。
+RESUME_FORMATS = ("json", "md", "html")
+RESUME_DEFAULT_FORMATS = ("json",)
 RESUME_STEM = "resume"
 
 
@@ -428,11 +431,20 @@ def render_html(resume: Resume, notes: bool = True, standalone: bool = True) -> 
     return "\n".join(parts)
 
 
-RESUME_RENDERERS = {"md": render_markdown, "html": render_html}
+def render_json(resume: Resume) -> str:
+    """排好版的简历 JSON：章节、条目与表格保留结构，方便程序消费或展示。"""
+    return json.dumps(asdict(resume), ensure_ascii=False, indent=2)
+
+
+RESUME_RENDERERS = {
+    "json": render_json,
+    "md": render_markdown,
+    "html": render_html,
+}
 
 
 def write_resume_files(
-    resume: Resume, out_dir, formats: Sequence[str] = RESUME_FORMATS, stem: str = "resume"
+    resume: Resume, out_dir, formats: Sequence[str] = RESUME_DEFAULT_FORMATS, stem: str = "resume"
 ) -> List[Path]:
     """把简历写到 out_dir，返回写出的文件路径（顺序与 formats 一致）。"""
     directory = Path(out_dir)
@@ -464,18 +476,18 @@ class ResumeTool(Tool):
 
     slug = "resume"
     title = "简历排版"
-    summary = "把简历 md 重排成简约大方的 md / html（三种风格，纯规则、不联网）"
+    summary = "把简历 md 重排成简约大方的 json（可选导出 md / html）；三种风格，纯规则、不联网"
     usage = (
         "python main.py --build-resume [--resume-style classic|structure|accent] "
         "[--resume-file input/profile/我的简历.md] [--resume-project input/project/示例项目1-AI周报助手.md] "
-        "[--resume-format md,html] [--resume-name 我的简历] [--out output]"
+        "[--resume-format json,md,html] [--resume-name 我的简历] [--out output]"
     )
 
     def run(
         self,
         resume_file,
         out_dir,
-        formats: Sequence[str] = RESUME_FORMATS,
+        formats: Sequence[str] = RESUME_DEFAULT_FORMATS,
         stem: Optional[str] = None,
         style: str = DEFAULT_STYLE,
         projects: Sequence = (),
@@ -490,10 +502,10 @@ class ResumeTool(Tool):
         unknown = [item for item in picked if item not in RESUME_FORMATS]
         if unknown:
             return ToolResult(
-                ok=False, error=f"简历不支持的输出格式：{'、'.join(unknown)}（可选 md / html）"
+                ok=False, error=f"简历不支持的输出格式：{'、'.join(unknown)}（可选 json / md / html）"
             )
         if not picked:
-            return ToolResult(ok=False, error="至少要选一种简历输出格式：md / html")
+            return ToolResult(ok=False, error="至少要选一种简历输出格式：json / md / html")
 
         source = Path(resume_file).expanduser()
         if not source.is_file():

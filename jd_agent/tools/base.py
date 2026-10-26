@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 @dataclass
@@ -22,19 +22,29 @@ class ToolResult:
     summary: List[Tuple[str, str]] = field(default_factory=list)  # (标签, 值)，给终端与前端显示
     notes: List[str] = field(default_factory=list)                # 做了什么规整 / 提示
     written: List[Path] = field(default_factory=list)             # 写出的文件
+    markdown: str = ""                                            # 给人看的 Markdown（可选）
+    data: Dict[str, Any] = field(default_factory=dict)            # 给 Runtime / 前端消费的结构化结果
+    trace: List[Any] = field(default_factory=list)                # 子流程产生的 TraceStep
 
     @property
     def files(self) -> List[str]:
         return [str(item) for item in self.written]
 
     def as_dict(self) -> dict:
-        return {
+        payload = {
             "ok": self.ok,
             "error": self.error,
             "summary": [{"label": label, "value": value} for label, value in self.summary],
             "notes": list(self.notes),
             "files": self.files,
         }
+        if self.markdown:
+            payload["markdown"] = self.markdown
+        if self.data:
+            payload["data"] = dict(self.data)
+        if self.trace:
+            payload["trace"] = list(self.trace)
+        return payload
 
 
 class Tool(ABC):

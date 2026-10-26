@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import logging
+import json
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..agents.agent import run_agent
-from ..agents.render import render_html, render_json, render_markdown
+from ..agents.render import (
+    render_html_from_payload,
+    render_json,
+    render_markdown_from_payload,
+)
 from ..agents.resume_polish import level_options, polish_resume, style_options
 from ..core.llm import DEFAULT_CALL_TIMEOUT, build_client
 from ..core.settings import DEFAULT_ENV_FILE, load_env, resolve_settings
@@ -50,6 +55,25 @@ class AnalysisService:
         candidate = self.output_dir / filename
         return candidate if candidate.is_file() else None
 
+    def report_content(self, task_id: str, report_format: str) -> Optional[str]:
+        """Serve a report in any format while ``output/`` keeps only the JSON artifact.
+
+        Markdown and HTML are derived from the persisted JSON on read, so no
+        extra report files are written to disk.
+        """
+        fmt = str(report_format or "json").strip().lower()
+        path = self.report_path(task_id, "json")
+        if path is None:
+            return None
+        if fmt == "json":
+            return path.read_text(encoding="utf-8")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if fmt == "md":
+            return render_markdown_from_payload(payload)
+        if fmt == "html":
+            return render_html_from_payload(payload)
+        return None
+
     def run(
         self,
         task_id: str,
@@ -58,6 +82,8 @@ class AnalysisService:
         jd_input: str,
         resume_input: str,
         answer: str = "",
+        strategy: str = "rule",
+        max_steps: int = 10,
     ) -> None:
         self.tasks.start(task_id)
         try:
@@ -71,6 +97,8 @@ class AnalysisService:
                 user_id=user_id,
                 jd_input=jd_input,
                 resume_input=resume_input,
+                strategy=strategy,
+                max_steps=max_steps,
             )
             generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -81,6 +109,8 @@ class AnalysisService:
                 memory=self.memory,
                 session_id=session_id or "default",
                 user_id=user_id or "default",
+                strategy=strategy,
+                max_steps=max_steps,
                 trace_callback=lambda step: self.tasks.append_trace(task_id, step),
             )
 
@@ -94,14 +124,9 @@ class AnalysisService:
                 return
 
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            reports: Dict[str, Path] = {
-                "md": self.output_dir / f"{task_id}.md",
-                "json": self.output_dir / f"{task_id}.json",
-                "html": self.output_dir / f"{task_id}.html",
-            }
-            reports["md"].write_text(render_markdown(state, generated_at), encoding="utf-8")
+            # output/ 只落一份 JSON；Markdown / HTML 在读取时从这份 JSON 重新渲染。
+            reports: Dict[str, Path] = {"json": self.output_dir / f"{task_id}.json"}
             reports["json"].write_text(render_json(state, generated_at), encoding="utf-8")
-            reports["html"].write_text(render_html(state, generated_at), encoding="utf-8")
             self.tasks.complete(task_id, reports)
         except Exception as exc:  # noqa: BLE001 - task boundary must record failures
             logger.exception("analysis task %s failed", task_id)
@@ -118,6 +143,8 @@ class AnalysisService:
             context["jd_input"],
             context["resume_input"],
             answer=answer,
+            strategy=context.get("strategy", "rule"),
+            max_steps=int(context.get("max_steps", 10)),
         )
 
     def _materialize_input(self, value: str, target: Path) -> Path:
@@ -159,11 +186,10 @@ class AnalysisService:
         )
         resume_id = uuid.uuid4().hex
         self.resume_output_dir.mkdir(parents=True, exist_ok=True)
-        (self.resume_output_dir / f"{resume_id}.md").write_text(result.markdown, encoding="utf-8")
-        (self.resume_output_dir / f"{resume_id}.html").write_text(result.html, encoding="utf-8")
         level_meta = next((item for item in level_options() if item["key"] == result.level), {})
         style_meta = next((item for item in style_options() if item["key"] == result.style), {})
-        return {
+        # output/resumes 同样只落一份 JSON：Markdown / HTML 只是其中的字段。
+        payload = {
             "resume_id": resume_id,
             "task_id": task_id or "",
             "level": result.level,
@@ -176,6 +202,10 @@ class AnalysisService:
             "stats": result.stats.__dict__,
             "notice": result.notice,
         }
+        (self.resume_output_dir / f"{resume_id}.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return payload
 
     def resume_path(self, resume_id: str, report_format: str) -> Optional[Path]:
         safe = "".join(ch for ch in str(resume_id or "") if ch.isalnum() or ch in "-_-")
@@ -183,6 +213,17 @@ class AnalysisService:
             return None
         candidate = self.resume_output_dir / f"{safe}.{report_format}"
         return candidate if candidate.is_file() else None
+
+    def resume_content(self, resume_id: str, report_format: str) -> Optional[str]:
+        """Read a generated resume from its JSON artifact (md / html are fields)."""
+        path = self.resume_path(resume_id, "json")
+        if path is None:
+            return None
+        fmt = str(report_format or "md").strip().lower()
+        if fmt == "json":
+            return path.read_text(encoding="utf-8")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return str(payload.get("markdown" if fmt == "md" else "html") or "")
 
     def _resume_source(self, *, task_id: str, resume_input: str) -> tuple[Path, str]:
         if task_id:

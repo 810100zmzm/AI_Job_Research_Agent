@@ -293,6 +293,11 @@ class TraceStep:
     decision: str
     decision_reason: str
 
+    @property
+    def reason(self) -> str:
+        """v4 planner contract alias: every step must carry a reason."""
+        return self.decision_reason
+
     def as_row(self) -> List[str]:
         return [
             str(self.index),
@@ -301,6 +306,26 @@ class TraceStep:
             self.state_update,
             f"{self.decision}（{self.decision_reason}）",
         ]
+
+
+@dataclass
+class AgentObservation:
+    """Structured observation fed back to the v4 planner."""
+
+    action: str
+    summary: str
+    data: Dict[str, Any] = field(default_factory=dict)
+    evidence_refs: List[str] = field(default_factory=list)
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "action": self.action,
+            "summary": self.summary,
+            "data": dict(self.data),
+            "evidence_refs": list(self.evidence_refs),
+            "reason": self.reason,
+        }
 
 
 @dataclass
@@ -343,6 +368,9 @@ class LlmBlock:
     idle: bool = False            # 按用户要求闲置（待改版），本次不调用模型
     skipped: bool = False         # 预算用完，没轮到它
     notes: List[str] = field(default_factory=list)
+    verified: bool = False        # v4：内容已逐条回到证据；False 表示未校验
+    evidence_refs: List[str] = field(default_factory=list)
+    dropped_claims: List[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -393,6 +421,10 @@ class LlmReport:
     retries: int = 1              # 失败重试次数
     blocks: List[LlmBlock] = field(default_factory=list)
     note: str = ""                # 整体说明，例如「未配置 DEEPSEEK_API_KEY」
+    strategy: str = ""
+    planner_calls: int = 0
+    verified_blocks: int = 0
+    dropped_claims: int = 0
 
     def block(self, source: str) -> Optional[LlmBlock]:
         for item in self.blocks:
@@ -472,6 +504,8 @@ class AgentState:
     verdict: Optional[Verdict] = None
     vision: VisionReport = field(default_factory=VisionReport)
     context: RetrievedContext = field(default_factory=RetrievedContext)
+    observations: List[AgentObservation] = field(default_factory=list)
+    strategy: str = "rule"
 
     @property
     def decision(self) -> str:

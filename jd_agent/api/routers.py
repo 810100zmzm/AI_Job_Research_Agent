@@ -101,6 +101,8 @@ def build_router(service: AnalysisService) -> APIRouter:
             payload.user_id,
             payload.jd_input,
             payload.resume_input,
+            strategy=payload.strategy,
+            max_steps=payload.max_steps,
         )
         return AnalyzeResponse(task_id=task.task_id)
 
@@ -146,13 +148,12 @@ def build_router(service: AnalysisService) -> APIRouter:
         report_format: Literal["md", "json", "html"] = Query("md", alias="format"),
         app_service: AnalysisService = Depends(get_service),
     ) -> Response:
-        path = app_service.report_path(task_id, report_format)
-        if path is None:
-            raise HTTPException(status_code=404, detail="报告尚未生成")
         try:
-            content = path.read_text(encoding="utf-8")
-        except OSError as exc:
+            content = app_service.report_content(task_id, report_format)
+        except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"读取报告失败：{exc}") from exc
+        if content is None:
+            raise HTTPException(status_code=404, detail="报告尚未生成")
         return Response(content=content, media_type=REPORT_MEDIA_TYPES[report_format])
 
     @router.get("/resume/options", response_model=ResumeOptionsResponse)
@@ -186,13 +187,12 @@ def build_router(service: AnalysisService) -> APIRouter:
         report_format: Literal["md", "html"] = Query("md", alias="format"),
         app_service: AnalysisService = Depends(get_service),
     ) -> Response:
-        path = app_service.resume_path(resume_id, report_format)
-        if path is None:
-            raise HTTPException(status_code=404, detail="简历尚未生成")
         try:
-            content = path.read_text(encoding="utf-8")
-        except OSError as exc:
+            content = app_service.resume_content(resume_id, report_format)
+        except (OSError, ValueError) as exc:
             raise HTTPException(status_code=500, detail=f"读取简历失败：{exc}") from exc
+        if content is None:
+            raise HTTPException(status_code=404, detail="简历尚未生成")
         return Response(content=content, media_type=REPORT_MEDIA_TYPES[report_format])
 
     @router.post("/records", response_model=RecordCreatedResponse)

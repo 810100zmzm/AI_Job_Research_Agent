@@ -25,7 +25,22 @@ from ..core.schema import (
     VERDICT_NO,
     VERDICT_YES,
     AgentState,
+    ContextItem,
+    AgentObservation,
+    EvidenceMatch,
+    ImageRef,
+    JobPosting,
     LlmBlock,
+    LlmReport,
+    Project,
+    ProjectFact,
+    Reason,
+    Requirement,
+    RetrievedContext,
+    Risk,
+    TraceStep,
+    Verdict,
+    VisionReport,
 )
 
 LEVEL_ICON = {
@@ -154,6 +169,8 @@ def _md_llm_block(block: LlmBlock) -> List[str]:
         "",
         f"- 状态：**{block.status}**（本块调用 {block.calls} 次，模型 `{block.model or '—'}`）",
     ]
+    if block.verified:
+        lines.append(f"- Verify：已校验；证据 {len(block.evidence_refs)} 条，丢弃 {len(block.dropped_claims)} 句")
     if block.items:
         lines.append("")
         for index, item in enumerate(block.items, start=1):
@@ -438,6 +455,7 @@ def _html_trace(state: AgentState) -> List[str]:
 def _html_params(state: AgentState) -> List[str]:
     rows = [
         ("证据等级", "有结果＝有量化指标或「已开源 / 已上线」这类交付；有动作＝有搭建 / 实现 / 调试等动词但没有结果；仅提及＝只出现在技术栈里"),
+        ("Agent 策略", f"{state.strategy}（rule 离线可复现；llm 有界 plan-act-observe + verify）"),
         ("值得写", f"核心要求覆盖 ≥ {COVERAGE_OK:.0%}，且有量化结果，且必备项无缺口"),
         ("值得写但要改写", f"覆盖在 {COVERAGE_MIN:.0%} ~ {COVERAGE_OK:.0%} 之间，或必备项有缺口"),
         ("暂不建议写", f"覆盖 < {COVERAGE_MIN:.0%}，或没有任何动作级证据"),
@@ -563,6 +581,14 @@ def _llm_param_rows(state: AgentState) -> List[Tuple[str, str]]:
     rows: List[Tuple[str, str]] = []
     report = state.llm_report
     if report is not None:
+        if report.strategy == "llm" or state.strategy == "llm":
+            rows.append(
+                (
+                    "v4 LLM 策略（--strategy llm）",
+                    "Planner 每一步只选择一个白名单动作；PolicyGuard 校验 action / args / reason；"
+                    "Observe 把结果回灌 state；Verify 丢弃无法回到 L0 证据的文字。",
+                )
+            )
         tasks = "、".join(f"{item.title}（{item.source}）" for item in report.blocks)
         rows.append(
             (
@@ -610,6 +636,7 @@ def _md_params(state: AgentState) -> List[str]:
         "",
         "| 项 | 规则 |",
         "|---|---|",
+        f"| Agent 策略 | `{state.strategy}`（rule = 离线可复现；llm = 有界 plan-act-observe + verify） |",
         "| 证据等级 | 有结果＝有量化指标或「已开源 / 已上线」这类交付；有动作＝有搭建 / 实现 / 调试等动词但没有结果；仅提及＝只出现在技术栈里 |",
         f"| 值得写 | 核心要求覆盖 ≥ {COVERAGE_OK:.0%}，且有量化结果，且必备项无缺口 |",
         f"| 值得写但要改写 | 覆盖在 {COVERAGE_MIN:.0%} ~ {COVERAGE_OK:.0%} 之间，或必备项有缺口 |",
@@ -648,18 +675,24 @@ def build_payload(state: AgentState, generated_at: str = "") -> Dict:
         "decision": state.decision,
         "rounds": state.rounds,
         "sufficiency": state.sufficiency,
+        "strategy": state.strategy,
         "jd": {
             "source_file": state.jd.source_file,
             "title": state.jd.title,
+            "name": state.jd.name,
             "company": state.jd.company,
             "job_type": state.jd.job_type,
             "position_count": state.jd.position_count,
             "position_titles": state.jd.position_titles,
             "requirement_count": len(state.jd.requirements),
+            "line_count": state.jd.line_count,
+            "bullet_count": state.jd.bullet_count,
         },
         "project": {
             "source_file": state.project.source_file,
             "title": state.project.title,
+            "name": state.project.name,
+            "line_count": state.project.line_count,
             "fact_count": len(state.project.facts),
             "result_facts": len(state.project.result_facts),
             "facts": [
@@ -692,20 +725,10 @@ def build_payload(state: AgentState, generated_at: str = "") -> Dict:
         "llm": _llm_payload(state),
         **({"context": _context_payload(state)} if not state.context.empty else {}),
         "core_requirements": [
-            {
-                "name": item.name,
-                "capability": item.capability_key,
-                "category": item.category,
-                "level": item.level,
-                "line_no": item.line_no,
-                "source_file": item.source_file,
-                "quote": item.quote,
-            }
-            for item in state.core_requirements
+            _requirement_payload(item) for item in state.core_requirements
         ],
         "skipped_requirements": [
-            {"name": item.name, "level": item.level, "line_no": item.line_no, "quote": item.quote}
-            for item in state.skipped_requirements
+            _requirement_payload(item) for item in state.skipped_requirements
         ],
         "evidence_matches": [
             {
@@ -726,6 +749,7 @@ def build_payload(state: AgentState, generated_at: str = "") -> Dict:
         ],
         "question": state.question or None,
         "question_reason": state.question_reason or None,
+        "observations": [item.to_dict() for item in state.observations],
         "verdict": None
         if verdict is None
         else {
@@ -758,6 +782,7 @@ def build_payload(state: AgentState, generated_at: str = "") -> Dict:
         ],
         "params": {
             "max_rounds": MAX_ROUNDS,
+            "strategy": state.strategy,
             "min_facts": MIN_FACTS,
             "coverage_ok": COVERAGE_OK,
             "coverage_min": COVERAGE_MIN,
@@ -784,6 +809,10 @@ def _llm_payload(state: AgentState) -> Optional[Dict]:
         "call_limit": report.call_limit,
         "timeout": report.timeout,
         "retries": report.retries,
+        "strategy": report.strategy,
+        "planner_calls": report.planner_calls,
+        "verified_blocks": report.verified_blocks,
+        "dropped_claims": report.dropped_claims,
         "note": report.note,
         "ok_count": report.ok_count,
         "blocks": [
@@ -797,8 +826,14 @@ def _llm_payload(state: AgentState) -> Optional[Dict]:
                 "text": item.text,
                 "items": item.items,
                 "error": item.error,
+                "enabled": item.enabled,
+                "idle": item.idle,
+                "skipped": item.skipped,
                 "failed": item.failed,
                 "discarded": item.discarded,
+                "verified": item.verified,
+                "evidence_refs": item.evidence_refs,
+                "dropped_claims": item.dropped_claims,
                 "notes": item.notes,
                 "note": "模型生成，不是判定依据；规则结论见 verdict",
             }
@@ -819,6 +854,267 @@ def _llm_stat(state: AgentState, name: str):
 
 def render_json(state: AgentState, generated_at: str = "") -> str:
     return json.dumps(build_payload(state, generated_at), ensure_ascii=False, indent=2)
+
+
+def _requirement_payload(item: Requirement) -> Dict:
+    """一条岗位要求的结构化形态：保留旧键（name / capability）并补齐重建所需字段。"""
+    return {
+        "name": item.name,
+        "capability": item.capability_key,
+        "capability_key": item.capability_key,
+        "capability_name": item.name,
+        "category": item.category,
+        "level": item.level,
+        "section": item.section,
+        "line_no": item.line_no,
+        "source_file": item.source_file,
+        "quote": item.quote,
+    }
+
+
+def _requirement_from_payload(data: Dict) -> Requirement:
+    return Requirement(
+        capability_key=str(data.get("capability_key") or data.get("capability") or ""),
+        capability_name=str(data.get("capability_name") or data.get("name") or ""),
+        category=str(data.get("category") or ""),
+        level=str(data.get("level") or ""),
+        section=str(data.get("section") or ""),
+        line_no=int(data.get("line_no") or 0),
+        quote=str(data.get("quote") or ""),
+        source_file=str(data.get("source_file") or ""),
+    )
+
+
+def _fact_parts(ref: str, line_no: int) -> Tuple[str, int]:
+    if "::L" in str(ref):
+        source_file, _, line = str(ref).rpartition("::L")
+        return source_file, int(line) if line.isdigit() else int(line_no or 0)
+    return str(ref), int(line_no or 0)
+
+
+def _fact_from_payload(data: Dict) -> ProjectFact:
+    source_file, line_no = _fact_parts(data.get("ref"), data.get("line_no"))
+    metrics = list(data.get("metrics") or [])
+    return ProjectFact(
+        text=str(data.get("text") or ""),
+        section=str(data.get("section") or ""),
+        line_no=line_no,
+        source_file=source_file or str(data.get("source_file") or ""),
+        capabilities=list(data.get("capabilities") or []),
+        negated=list(data.get("negated") or []),
+        level=str(data.get("level") or EVIDENCE_MENTION),
+        has_metric=bool(metrics or data.get("has_metric")),
+        metrics=metrics,
+    )
+
+
+def _llm_report_from_payload(data: Optional[Dict]) -> Optional[LlmReport]:
+    if not data:
+        return None
+    blocks = [
+        LlmBlock(
+            source=str(item.get("source") or ""),
+            title=str(item.get("title") or ""),
+            model=str(item.get("model") or ""),
+            enabled=bool(item.get("enabled", True)),
+            calls=int(item.get("calls") or 0),
+            text=str(item.get("text") or ""),
+            items=list(item.get("items") or []),
+            error=str(item.get("error") or ""),
+            failed=bool(item.get("failed")),
+            discarded=bool(item.get("discarded")),
+            idle=bool(item.get("idle")),
+            skipped=bool(item.get("skipped")),
+            verified=bool(item.get("verified")),
+            evidence_refs=list(item.get("evidence_refs") or []),
+            dropped_claims=list(item.get("dropped_claims") or []),
+            notes=list(item.get("notes") or []),
+        )
+        for item in data.get("blocks") or []
+    ]
+    return LlmReport(
+        enabled=bool(data.get("enabled")),
+        model=str(data.get("model") or ""),
+        calls=int(data.get("calls") or 0),
+        call_limit=int(data.get("call_limit") or 10),
+        timeout=float(data.get("timeout") or 30.0),
+        retries=int(data.get("retries") or 0),
+        blocks=blocks,
+        note=str(data.get("note") or ""),
+        strategy=str(data.get("strategy") or ""),
+        planner_calls=int(data.get("planner_calls") or 0),
+        verified_blocks=int(data.get("verified_blocks") or 0),
+        dropped_claims=int(data.get("dropped_claims") or 0),
+    )
+
+
+def state_from_payload(payload: Dict) -> AgentState:
+    """把持久化的 JSON payload 还原成可以再次渲染的 AgentState。
+
+    output/ 只存 JSON；Markdown / HTML 报告在读取时由这份 payload 重新渲染，
+    因此需要把证据、结论、Trace 这些都还原回对象。
+    """
+    jd_data = payload.get("jd") or {}
+    project_data = payload.get("project") or {}
+    core = [_requirement_from_payload(item) for item in payload.get("core_requirements") or []]
+    by_name = {}
+    by_line = {}
+    for requirement in core:
+        by_name.setdefault(requirement.capability_name, requirement)
+        by_line.setdefault((requirement.capability_name, requirement.line_no), requirement)
+    matches: List[EvidenceMatch] = []
+    for item in payload.get("evidence_matches") or []:
+        name = str(item.get("requirement") or "")
+        source_file, line_no = _fact_parts(item.get("jd_ref"), 0)
+        requirement = by_line.get((name, line_no)) or by_name.get(name)
+        if requirement is None:
+            requirement = Requirement(
+                capability_key="",
+                capability_name=name,
+                category="",
+                level="",
+                section="",
+                line_no=line_no,
+                quote=name,
+                source_file=source_file,
+            )
+        matches.append(
+            EvidenceMatch(
+                requirement=requirement,
+                facts=[_fact_from_payload(fact) for fact in item.get("project_evidence") or []],
+                level=str(item.get("level") or EVIDENCE_NONE),
+                matched_subs=list(item.get("matched_subs") or []),
+                missing_subs=list(item.get("missing_subs") or []),
+                relaxed=bool(item.get("relaxed")),
+                note=str(item.get("note") or ""),
+            )
+        )
+    jd = JobPosting(
+        jd_id=str(jd_data.get("name") or jd_data.get("source_file") or ""),
+        title=str(jd_data.get("title") or ""),
+        source_file=str(jd_data.get("source_file") or ""),
+        company=str(jd_data.get("company") or ""),
+        job_type=str(jd_data.get("job_type") or ""),
+        line_count=int(jd_data.get("line_count") or 0),
+        bullet_count=int(jd_data.get("bullet_count") or 0),
+        position_count=int(jd_data.get("position_count") or 1),
+        position_titles=list(jd_data.get("position_titles") or []),
+        requirements=core,
+    )
+    project = Project(
+        title=str(project_data.get("title") or ""),
+        source_file=str(project_data.get("source_file") or ""),
+        line_count=int(project_data.get("line_count") or 0),
+        facts=[_fact_from_payload(fact) for fact in project_data.get("facts") or []],
+    )
+    vision_data = payload.get("vision") or {}
+    vision = VisionReport(
+        enabled=bool(vision_data.get("enabled")),
+        model=str(vision_data.get("model") or ""),
+        images=[
+            ImageRef(
+                raw=str(item.get("raw") or ""),
+                path=str(item.get("path") or ""),
+                ref=str(item.get("ref") or ""),
+                line_no=int(item.get("line_no") or 0),
+            )
+            for item in vision_data.get("images") or []
+        ],
+        parsed=int(vision_data.get("parsed") or 0),
+        facts_added=int(vision_data.get("facts_added") or 0),
+        error=str(vision_data.get("error") or ""),
+        notes=list(vision_data.get("notes") or []),
+    )
+    context_data = payload.get("context") or {}
+    context = RetrievedContext(
+        memory=[_context_item(item) for item in context_data.get("memory") or []],
+        knowledge=[_context_item(item) for item in context_data.get("knowledge") or []],
+    )
+    verdict_data = payload.get("verdict")
+    verdict = None
+    if verdict_data:
+        verdict = Verdict(
+            call=str(verdict_data.get("call") or ""),
+            headline=str(verdict_data.get("headline") or ""),
+            reasons=[
+                Reason(
+                    text=str(item.get("text") or ""),
+                    requirement_name=str(item.get("requirement") or ""),
+                    jd_ref=str(item.get("jd_ref") or ""),
+                    project_refs=list(item.get("project_refs") or []),
+                )
+                for item in verdict_data.get("reasons") or []
+            ],
+            risks=[
+                Risk(
+                    text=str(item.get("text") or ""),
+                    kind=str(item.get("kind") or ""),
+                    refs=list(item.get("refs") or []),
+                )
+                for item in verdict_data.get("risks") or []
+            ],
+            rewrite=str(verdict_data.get("rewrite") or ""),
+            stop_reason=str(verdict_data.get("stop_reason") or ""),
+            llm_report=_llm_report_from_payload(payload.get("llm")),
+        )
+    return AgentState(
+        jd=jd,
+        project=project,
+        core_requirements=core,
+        skipped_requirements=[
+            _requirement_from_payload(item) for item in payload.get("skipped_requirements") or []
+        ],
+        matches=matches,
+        trace=[
+            TraceStep(
+                index=int(item.get("step") or 0),
+                action=str(item.get("action") or ""),
+                observation=str(item.get("observation") or ""),
+                state_update=str(item.get("state_update") or ""),
+                decision=str(item.get("decision") or ""),
+                decision_reason=str(item.get("decision_reason") or ""),
+            )
+            for item in payload.get("trace") or []
+        ],
+        rounds=int(payload.get("rounds") or 1),
+        question=str(payload.get("question") or ""),
+        question_reason=str(payload.get("question_reason") or ""),
+        sufficiency=str(payload.get("sufficiency") or ""),
+        verdict=verdict,
+        vision=vision,
+        context=context,
+        observations=[
+            AgentObservation(
+                action=str(item.get("action") or ""),
+                summary=str(item.get("summary") or ""),
+                data=dict(item.get("data") or {}),
+                evidence_refs=list(item.get("evidence_refs") or []),
+                reason=str(item.get("reason") or ""),
+            )
+            for item in payload.get("observations") or []
+        ],
+        strategy=str(payload.get("strategy") or payload.get("params", {}).get("strategy") or "rule"),
+    )
+
+
+def _context_item(data: Dict) -> ContextItem:
+    return ContextItem(
+        source=str(data.get("source") or ""),
+        text=str(data.get("text") or ""),
+        score=float(data.get("score") or 0.0),
+        category=str(data.get("category") or ""),
+        metadata=dict(data.get("metadata") or {}),
+    )
+
+
+def render_markdown_from_payload(payload: Dict) -> str:
+    """从持久化 JSON 还原出 Markdown 报告（output/ 不再落盘 Markdown）。"""
+    return render_markdown(state_from_payload(payload), str(payload.get("generated_at") or ""))
+
+
+def render_html_from_payload(payload: Dict) -> str:
+    """从持久化 JSON 还原出 HTML 报告（output/ 不再落盘 HTML）。"""
+    return render_html(state_from_payload(payload), str(payload.get("generated_at") or ""))
 
 
 # ---- 终端 ------------------------------------------------------------------

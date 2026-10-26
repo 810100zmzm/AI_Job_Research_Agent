@@ -253,14 +253,13 @@ class TestAgentLoop(TempCase):
 
 
 class TestCli(TempCase):
-    def test_writes_three_formats_and_exits_zero(self) -> None:
+    def test_default_output_is_json_only(self) -> None:
         out = self.tmp / "out"
         code = cli.main(
             ["--jd", str(self.jd_path), "--project", str(self.rich_path), "--out", str(out), "--quiet"]
         )
         self.assertEqual(code, cli.EXIT_OK)
-        for suffix in ("md", "json", "html"):
-            self.assertTrue((out / f"resume_decision.{suffix}").is_file())
+        self.assertEqual(sorted(item.name for item in out.glob("*")), ["resume_decision.json"])
         payload = _payload(out)
         self.assertEqual(payload["decision"], "Stop")
         self.assertTrue(payload["verdict"]["stop_reason"])
@@ -268,6 +267,18 @@ class TestCli(TempCase):
         for step in payload["trace"]:
             self.assertTrue(step["observation"])
             self.assertTrue(step["state_update"])
+
+    def test_explicit_formats_can_still_export_markdown_and_html(self) -> None:
+        out = self.tmp / "out_all"
+        code = cli.main(
+            [
+                "--jd", str(self.jd_path), "--project", str(self.rich_path),
+                "--out", str(out), "--formats", "md,html", "--quiet",
+            ]
+        )
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertTrue((out / "resume_decision.md").is_file())
+        self.assertTrue((out / "resume_decision.html").is_file())
 
     def test_ask_exits_three(self) -> None:
         out = self.tmp / "out3"

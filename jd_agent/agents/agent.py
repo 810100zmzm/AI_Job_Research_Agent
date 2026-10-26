@@ -34,6 +34,19 @@ from .generate import (
     generate_llm_report,
     unavailable_llm_report,
 )
+from .runtime import (
+    AgentPolicy,
+    DecisionEngine,
+    MemoryGateway,
+    Observer,
+    PlannedAction,
+    Planner,
+    PlannerError,
+    PolicyGuard,
+    STRATEGY_LLM,
+    STRATEGY_RULE,
+)
+from .verify import verify_llm_report
 from ..domain.jd import load_jd
 from ..core.llm import (
     DEFAULT_CALL_LIMIT,
@@ -106,6 +119,9 @@ def run_agent(
     user_id: str = "default",
     knowledge_tiers: Sequence[str] = (),
     context_limit: int = 6,
+    strategy: str = "",
+    agent_policy: Optional[AgentPolicy] = None,
+    max_steps: int = 10,
     trace_callback: Optional[Callable[[TraceStep], None]] = None,
 ) -> AgentState:
     """跑完一次完整的 Agent Loop，返回带着 Trace 的状态。
@@ -119,6 +135,34 @@ def run_agent(
     """
     if max_rounds < 1:
         raise ValueError("max_rounds 至少为 1")
+
+    policy = agent_policy or AgentPolicy.for_strategy(strategy or STRATEGY_RULE, max_steps=max_steps, max_rounds=max_rounds)
+    if policy.strategy == STRATEGY_LLM:
+        from .v4_flow import run_llm_strategy
+
+        return run_llm_strategy(
+            jd_path=jd_path,
+            project_path=project_path,
+            answer=answer,
+            select_title=select_title,
+            max_rounds=max_rounds,
+            vision=vision,
+            llm_max_calls=llm_max_calls,
+            settings=settings,
+            text_client=text_client,
+            vision_client=vision_client,
+            images=images,
+            posting=posting,
+            llm_budget=llm_budget,
+            memory=memory,
+            knowledge=knowledge,
+            session_id=session_id,
+            user_id=user_id,
+            knowledge_tiers=knowledge_tiers,
+            context_limit=context_limit,
+            policy=policy,
+            trace_callback=trace_callback,
+        )
 
     trace: List[TraceStep] = []
 
